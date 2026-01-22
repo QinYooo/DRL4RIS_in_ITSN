@@ -1,0 +1,11 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://cto.hxrra.com",
+    "ANTHROPIC_AUTH_TOKEN": "sk-eZQ4N0xqhrGJN4yJGivNKbw1CUa8BRn4aktf8JA62AhmYpYFN6HnmKc6"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python:*)"
+    ]
+  }
+}
