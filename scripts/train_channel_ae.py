@@ -39,7 +39,7 @@ class ChannelDataset(Dataset):
 
 def collect_channel_samples(n_samples=10000, seed=42):
     """
-    Collect channel samples from random satellite trajectories
+    Collect channel samples from random satellite trajectories using ITSNEnv
 
     Args:
         n_samples: Number of channel samples to collect
@@ -48,76 +48,93 @@ def collect_channel_samples(n_samples=10000, seed=42):
     Returns:
         Array of channel vectors (n_samples, input_dim)
     """
-    print(f"Collecting {n_samples} channel samples...")
+    print(f"Collecting {n_samples} channel samples using ITSNEnv...")
 
-    scenario = ITSNScenario(rng_seed=seed)
-    rng = np.random.RandomState(seed)
+    # Import ITSNEnv
+    from envs.itsn_env import ITSNEnv
+
+    # Create environment with diverse trajectory settings
+    env = ITSNEnv(
+        rng_seed=seed,
+        max_steps_per_episode=50,  # Long episodes for more samples
+        n_substeps=1,  # No substeps needed for data collection
+        ephemeris_noise_std=0.5  # Include ephemeris noise for robustness
+    )
 
     # Compute input dimension
-    input_dim, dims_breakdown = compute_channel_input_dim(scenario)
+    input_dim, dims_breakdown = compute_channel_input_dim(env.scenario)
     print(f"Channel vector dimension: {input_dim}")
     print("Breakdown:", dims_breakdown)
 
     channel_samples = []
+    rng = np.random.RandomState(seed)
 
-    # Generate diverse trajectories
-    n_trajectories = max(100, n_samples // 100)
-    samples_per_traj = n_samples // n_trajectories
+    # Calculate number of episodes needed
+    samples_per_episode = env.max_steps * env.n_substeps
+    n_episodes = max(100, (n_samples + samples_per_episode - 1) // samples_per_episode)
 
-    for traj_idx in range(n_trajectories):
-        # Reset user positions for diversity
-        scenario.reset_user_positions()
+    print(f"Collecting from {n_episodes} episodes (~{samples_per_episode} samples/episode)")
 
-        # Generate random trajectory
-        n_steps = rng.randint(50, 150)
-        max_ele = rng.uniform(60, 88)
-        start_ele = rng.uniform(15, 40)
-        end_ele = rng.uniform(15, 40)
+    for episode_idx in range(n_episodes):
+        # Reset environment with random seed for diversity
+        episode_seed = seed + episode_idx
+        obs, info = env.reset(seed=episode_seed)
 
-        peak_ratio = rng.uniform(0.3, 0.7)
-        peak_step = max(1, int(n_steps * peak_ratio))
+        # Collect initial channel sample
+        channels = env.current_channels
+        channel_vec = preprocess_channels(channels, use_inferred_G_SAT=False)
+        channel_samples.append(channel_vec)
 
-        ele_up = np.linspace(start_ele, max_ele, peak_step)
-        ele_down = np.linspace(max_ele, end_ele, n_steps - peak_step)
-        elevations = np.concatenate([ele_up, ele_down])
-
-        azimuths = np.linspace(
-            rng.uniform(45, 135),
-            rng.uniform(45, 315),
-            n_steps
-        )
-
-        # Sample channels along trajectory
-        sample_indices = rng.choice(n_steps, size=min(samples_per_traj, n_steps), replace=False)
-
-        for step_idx in sample_indices:
-            # Update satellite position
-            scenario.update_satellite_position(
-                elevations[step_idx],
-                azimuths[step_idx],
-                orbit_height=500e3
+        # Also collect inferred G_SAT version for robustness
+        if env.inferred_G_SAT is not None:
+            channel_vec_inferred = preprocess_channels(
+                channels, use_inferred_G_SAT=True, inferred_G_SAT=env.inferred_G_SAT
             )
+            channel_samples.append(channel_vec_inferred)
 
-            # Generate channels
-            channels = scenario.generate_channels()
+        # Rollout episode and collect samples
+        for step in range(env.max_steps):
+            # Random action
+            action = env.action_space.sample()
+            obs, reward, terminated, truncated, info = env.step(action)
 
-            # Preprocess to vector
+            # Collect channel sample
+            channels = env.current_channels
             channel_vec = preprocess_channels(channels, use_inferred_G_SAT=False)
             channel_samples.append(channel_vec)
 
-        if (traj_idx + 1) % 10 == 0:
-            print(f"  Trajectory {traj_idx + 1}/{n_trajectories}, Samples: {len(channel_samples)}")
+            # Also collect inferred version
+            if env.inferred_G_SAT is not None:
+                channel_vec_inferred = preprocess_channels(
+                    channels, use_inferred_G_SAT=True, inferred_G_SAT=env.inferred_G_SAT
+                )
+                channel_samples.append(channel_vec_inferred)
 
-    channel_samples = np.array(channel_samples[:n_samples])
+            if terminated or truncated:
+                break
+
+        if (episode_idx + 1) % 10 == 0:
+            print(f"  Episode {episode_idx + 1}/{n_episodes}, Samples: {len(channel_samples)}")
+
+        # Early stop if we have enough samples
+        if len(channel_samples) >= n_samples * 1.2:  # Collect 20% extra for better coverage
+            break
+
+    # Shuffle and trim to desired size
+    channel_samples = np.array(channel_samples)
+    rng.shuffle(channel_samples)
+    channel_samples = channel_samples[:n_samples]
+
     print(f"Collected {len(channel_samples)} samples")
 
     return channel_samples, input_dim
 
 
 def train_autoencoder(channel_samples, input_dim, latent_dim=32,
-                     epochs=100, batch_size=128, lr=1e-3, device='cuda'):
+                     epochs=100, batch_size=128, lr=1e-3, device='cuda',
+                     checkpoint_dir=None):
     """
-    Train the channel autoencoder
+    Train the channel autoencoder with checkpointing
 
     Args:
         channel_samples: Array of channel vectors
@@ -127,6 +144,7 @@ def train_autoencoder(channel_samples, input_dim, latent_dim=32,
         batch_size: Batch size
         lr: Learning rate
         device: 'cuda' or 'cpu'
+        checkpoint_dir: Directory to save checkpoints
 
     Returns:
         Trained autoencoder model, normalization stats, training history
@@ -161,8 +179,11 @@ def train_autoencoder(channel_samples, input_dim, latent_dim=32,
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
     # Training loop
-    history = {'train_loss': [], 'val_loss': []}
+    history = {'train_loss': [], 'val_loss': [], 'learning_rate': []}
     best_val_loss = float('inf')
+    best_model_state = None
+    patience_counter = 0
+    early_stop_patience = 20
 
     print("\nTraining...")
     for epoch in range(epochs):
@@ -196,19 +217,44 @@ def train_autoencoder(channel_samples, input_dim, latent_dim=32,
 
         # Update scheduler
         scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
 
         # Save history
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
+        history['learning_rate'].append(current_lr)
 
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_model_state = model.state_dict().copy()
+            patience_counter = 0
+
+            # Save checkpoint
+            if checkpoint_dir is not None:
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': best_model_state,
+                    'input_dim': input_dim,
+                    'latent_dim': latent_dim,
+                    'normalization_stats': {'mean': mean, 'std': std},
+                    'val_loss': best_val_loss,
+                    'history': history
+                }
+                checkpoint_path = checkpoint_dir / 'channel_ae_best.pth'
+                torch.save(checkpoint, checkpoint_path)
+        else:
+            patience_counter += 1
 
         # Print progress
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{epochs}: Train Loss={train_loss:.6f}, Val Loss={val_loss:.6f}")
+            print(f"Epoch {epoch+1}/{epochs}: Train={train_loss:.6f}, Val={val_loss:.6f}, "
+                  f"Best={best_val_loss:.6f}, LR={current_lr:.2e}")
+
+        # Early stopping
+        if patience_counter >= early_stop_patience:
+            print(f"\nEarly stopping at epoch {epoch+1} (no improvement for {early_stop_patience} epochs)")
+            break
 
     # Load best model
     model.load_state_dict(best_model_state)
@@ -258,9 +304,9 @@ def visualize_reconstruction(model, channel_samples, normalization_stats, n_samp
 
 def main():
     # Configuration
-    N_SAMPLES = 10000
+    N_SAMPLES = 20000  # Increased for better coverage
     LATENT_DIM = 32
-    EPOCHS = 100
+    EPOCHS = 200  # More epochs with early stopping
     BATCH_SIZE = 128
     LR = 1e-3
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -269,36 +315,76 @@ def main():
     output_dir = Path(__file__).parent.parent / 'checkpoints' / 'channel_ae'
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    print("=" * 60)
+    print("Channel Autoencoder Training")
+    print("=" * 60)
+    print(f"Configuration:")
+    print(f"  Samples: {N_SAMPLES}")
+    print(f"  Latent dim: {LATENT_DIM}")
+    print(f"  Epochs: {EPOCHS}")
+    print(f"  Batch size: {BATCH_SIZE}")
+    print(f"  Learning rate: {LR}")
+    print(f"  Device: {DEVICE}")
+    print(f"  Output: {output_dir}")
+    print("=" * 60)
+
     # Collect data
     channel_samples, input_dim = collect_channel_samples(n_samples=N_SAMPLES)
+
+    # Save raw data for future use
+    data_path = output_dir / 'channel_samples.npz'
+    np.savez_compressed(data_path, samples=channel_samples, input_dim=input_dim)
+    print(f"\nRaw data saved to {data_path}")
 
     # Train autoencoder
     model, norm_stats, history = train_autoencoder(
         channel_samples, input_dim, latent_dim=LATENT_DIM,
-        epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LR, device=DEVICE
+        epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LR, device=DEVICE,
+        checkpoint_dir=output_dir
     )
 
-    # Save model
+    # Save final model
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'input_dim': input_dim,
         'latent_dim': LATENT_DIM,
         'normalization_stats': norm_stats,
-        'history': history
+        'history': history,
+        'config': {
+            'n_samples': N_SAMPLES,
+            'epochs': EPOCHS,
+            'batch_size': BATCH_SIZE,
+            'lr': LR
+        }
     }
     checkpoint_path = output_dir / 'channel_ae_best.pth'
     torch.save(checkpoint, checkpoint_path)
-    print(f"\nModel saved to {checkpoint_path}")
+    print(f"\nFinal model saved to {checkpoint_path}")
 
     # Plot training curves
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(history['train_loss'], label='Train Loss')
-    ax.plot(history['val_loss'], label='Val Loss')
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Loss curves
+    ax = axes[0]
+    ax.plot(history['train_loss'], label='Train Loss', alpha=0.8)
+    ax.plot(history['val_loss'], label='Val Loss', alpha=0.8)
     ax.set_xlabel('Epoch')
     ax.set_ylabel('MSE Loss')
-    ax.set_title('Channel Autoencoder Training')
+    ax.set_title('Training and Validation Loss')
     ax.legend()
     ax.grid(True, alpha=0.3)
+    ax.set_yscale('log')
+
+    # Learning rate
+    ax = axes[1]
+    ax.plot(history['learning_rate'], color='green', alpha=0.8)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Learning Rate')
+    ax.set_title('Learning Rate Schedule')
+    ax.grid(True, alpha=0.3)
+    ax.set_yscale('log')
+
+    plt.tight_layout()
     plt.savefig(output_dir / 'training_curve.png', dpi=150, bbox_inches='tight')
     print(f"Training curve saved to {output_dir / 'training_curve.png'}")
 
@@ -307,7 +393,50 @@ def main():
     plt.savefig(output_dir / 'reconstruction_samples.png', dpi=150, bbox_inches='tight')
     print(f"Reconstruction samples saved to {output_dir / 'reconstruction_samples.png'}")
 
-    print("\nTraining complete!")
+    # Compute final statistics
+    print("\n" + "=" * 60)
+    print("Training Summary")
+    print("=" * 60)
+    print(f"Best validation loss: {min(history['val_loss']):.6f}")
+    print(f"Final train loss: {history['train_loss'][-1]:.6f}")
+    print(f"Final val loss: {history['val_loss'][-1]:.6f}")
+    print(f"Total epochs: {len(history['train_loss'])}")
+    print(f"Model size: {sum(p.numel() for p in model.parameters()):,} parameters")
+
+    # Compute reconstruction error statistics
+    model.eval()
+    device = torch.device(DEVICE if torch.cuda.is_available() else 'cpu')
+    mean = norm_stats['mean']
+    std = norm_stats['std']
+
+    # Sample 1000 random samples for evaluation
+    eval_indices = np.random.choice(len(channel_samples), size=min(1000, len(channel_samples)), replace=False)
+    eval_samples = channel_samples[eval_indices]
+    normalized = (eval_samples - mean) / (std + 1e-8)
+
+    with torch.no_grad():
+        x = torch.FloatTensor(normalized).to(device)
+        recon, latent = model(x)
+        recon = recon.cpu().numpy()
+
+    # Denormalize
+    recon = recon * std + mean
+
+    # Compute errors
+    mse = np.mean((eval_samples - recon) ** 2, axis=1)
+    mae = np.mean(np.abs(eval_samples - recon), axis=1)
+
+    print(f"\nReconstruction Error (on {len(eval_samples)} samples):")
+    print(f"  MSE: mean={np.mean(mse):.6f}, std={np.std(mse):.6f}")
+    print(f"  MAE: mean={np.mean(mae):.6f}, std={np.std(mae):.6f}")
+    print(f"  Relative error: {np.mean(mae) / (np.abs(eval_samples).mean() + 1e-8) * 100:.2f}%")
+
+    print("\n" + "=" * 60)
+    print("Training complete!")
+    print("=" * 60)
+    print(f"\nCheckpoint: {checkpoint_path}")
+    print(f"Use this checkpoint with ITSNEnvAE:")
+    print(f"  env = ITSNEnvAE(ae_checkpoint_path='{checkpoint_path}')")
 
 
 if __name__ == '__main__':
