@@ -21,7 +21,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.utils import set_random_seed
 
 
-def make_env(ae_checkpoint_path, rank, seed=0, **env_kwargs):
+def make_env(ae_checkpoint_path, rank, seed=0, device='cuda', **env_kwargs):
     """
     Utility function for multiprocessed env.
 
@@ -29,12 +29,14 @@ def make_env(ae_checkpoint_path, rank, seed=0, **env_kwargs):
         ae_checkpoint_path: Path to pre-trained AE checkpoint
         rank: Index of the subprocess
         seed: Random seed
+        device: Device for AE inference
         **env_kwargs: Additional environment arguments
     """
     def _init():
         env = ITSNEnvAE(
             ae_checkpoint_path=ae_checkpoint_path,
             rng_seed=seed + rank,
+            device=device,
             **env_kwargs
         )
         env = Monitor(env)
@@ -114,14 +116,14 @@ def train_rl_agent(
     # Create vectorized environments
     if n_envs > 1:
         env = SubprocVecEnv([
-            make_env(ae_checkpoint_path, i, seed, **env_kwargs)
+            make_env(ae_checkpoint_path, i, seed, device, **env_kwargs)
             for i in range(n_envs)
         ])
     else:
-        env = DummyVecEnv([make_env(ae_checkpoint_path, 0, seed, **env_kwargs)])
+        env = DummyVecEnv([make_env(ae_checkpoint_path, 0, seed, device, **env_kwargs)])
 
     # Create evaluation environment
-    eval_env = DummyVecEnv([make_env(ae_checkpoint_path, 999, seed, **env_kwargs)])
+    eval_env = DummyVecEnv([make_env(ae_checkpoint_path, 999, seed, device, **env_kwargs)])
 
     # Create PPO agent
     model = PPO(
@@ -243,13 +245,12 @@ def main():
         print("  python scripts/train_channel_ae.py")
         return 1
 
-    # Environment kwargs
+    # Environment kwargs (device will be passed separately to train_rl_agent)
     env_kwargs = {
         'max_steps_per_episode': args.max_steps,
         'n_substeps': args.n_substeps,
         'phase_bits': args.phase_bits,
-        'latent_dim': args.latent_dim,
-        'device': args.device
+        'latent_dim': args.latent_dim
     }
 
     # Train
