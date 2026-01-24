@@ -17,7 +17,7 @@ from envs.itsn_env_ae import ITSNEnvAE
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.utils import set_random_seed
 
 
@@ -122,8 +122,12 @@ def train_rl_agent(
     else:
         env = DummyVecEnv([make_env(ae_checkpoint_path, 0, seed, device, **env_kwargs)])
 
+    # Normalize rewards for better learning
+    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+
     # Create evaluation environment
     eval_env = DummyVecEnv([make_env(ae_checkpoint_path, 999, seed, device, **env_kwargs)])
+    eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=False, training=False)
 
     # Create PPO agent
     model = PPO(
@@ -183,6 +187,7 @@ def train_rl_agent(
     # Save final model
     final_model_path = log_path / 'final_model'
     model.save(final_model_path)
+    env.save(str(log_path / 'final_model' / 'vec_normalize.pkl'))
     print(f"\nFinal model saved to {final_model_path}")
 
     # Close environments
