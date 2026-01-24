@@ -423,13 +423,15 @@ class ITSNEnv(gym.Env):
             if success:
                 P_BS = self.scenario.P_bs_scale * P_BS_norm
                 sinr_min_db = 10 * np.log10(np.min(all_sinr_true) + 1e-12)
-                print(f"[Init] ZF on inferred G_SAT: P_BS={P_BS:.4f}W, P_sat={P_sat_init:.4f}W, "
-                      f"True SINR_min={sinr_min_db:.2f}dB")
+                # print(f"[Init] ZF on inferred G_SAT: P_BS={P_BS:.4f}W, P_sat={P_sat_init:.4f}W, "
+                #       f"True SINR_min={sinr_min_db:.2f}dB")
             else:
-                print(f"[Init] ZF-waterfilling warning: {bf_info.get('note', 'Unknown issue')}")
+                pass
+                # print(f"[Init] ZF-waterfilling warning: {bf_info.get('note', 'Unknown issue')}")
 
         except Exception as e:
-            print(f"[Init] ZF-waterfilling failed: {e}")
+            pass
+            # print(f"[Init] ZF-waterfilling failed: {e}")
 
         # Initialize prev_* variables for state construction (regardless of success)
         self.prev_Phi = Phi_init
