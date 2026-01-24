@@ -81,7 +81,7 @@ class ITSNEnvAE(ITSNEnv):
             raise FileNotFoundError(f"Autoencoder checkpoint not found: {checkpoint_path}")
 
         print(f"[ITSNEnvAE] Loading autoencoder from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         # Extract model parameters
         input_dim = checkpoint['input_dim']
