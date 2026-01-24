@@ -31,6 +31,7 @@ class ITSNEnv(gym.Env):
     def __init__(self,
                  rng_seed=None,
                  max_steps_per_episode=40,
+                 n_substeps=1,  # Number of physics substeps per RL step
                  phase_bits=4,  # 1-bit or 2-bit quantization
                  sinr_threshold_db=10.0,  # Minimum SINR requirement
                  sinr_penalty_weight=100.0,
@@ -46,7 +47,10 @@ class ITSNEnv(gym.Env):
 
         # Episode parameters
         self.max_steps = max_steps_per_episode
-        self.current_step = 0
+        self.n_substeps = n_substeps  # Physics substeps per RL decision
+        self.total_physics_steps = max_steps_per_episode * n_substeps
+        self.current_step = 0  # RL step counter
+        self.current_physics_step = 0  # Physics step counter
         self.orbit_height = orbit_height
 
         # RIS quantization
@@ -142,10 +146,12 @@ class ITSNEnv(gym.Env):
             self.rng = np.random.RandomState(seed)
             self.scenario = ITSNScenario(rng_seed=seed)
 
-        # Reset step counter
-        self.current_step = 0
+        # Reset step counters
+        self.current_step = 0  # RL step
+        self.current_physics_step = 0  # Physics step
 
         # Load trajectory from options or generate default
+        # Trajectory length = total_physics_steps (not max_steps)
         if options is not None and 'trajectory' in options:
             # Use external trajectory
             traj = options['trajectory']
@@ -153,21 +159,31 @@ class ITSNEnv(gym.Env):
             self.trajectory_azimuth = np.array(traj['azimuth'])
 
             # Validate trajectory length
-            if len(self.trajectory_elevation) != self.max_steps or len(self.trajectory_azimuth) != self.max_steps:
-                raise ValueError(f"Trajectory length mismatch: expected {self.max_steps}, "
+            if len(self.trajectory_elevation) != self.total_physics_steps or len(self.trajectory_azimuth) != self.total_physics_steps:
+                raise ValueError(f"Trajectory length mismatch: expected {self.total_physics_steps}, "
                                f"got elevation={len(self.trajectory_elevation)}, azimuth={len(self.trajectory_azimuth)}")
         else:
-            # Generate default trajectory (satellite pass)
-            mid_point = self.max_steps // 2
-            ele_up = np.linspace(30, 85, mid_point)
-            ele_down = np.linspace(85, 30, self.max_steps - mid_point)
+            # Generate default trajectory (satellite pass) with diversity
+            # 1. Randomize peak elevation (60°~88°)
+            max_ele = self.rng.uniform(60, 88)
+
+            # 2. Randomize start/end elevation (15°~40°, can differ)
+            start_ele = self.rng.uniform(15, 40)
+            end_ele = self.rng.uniform(15, 40)
+
+            # 3. Asymmetric trajectory: peak at 30%~70% of pass
+            peak_ratio = self.rng.uniform(0.3, 0.7)
+            peak_step = max(1, int(self.total_physics_steps * peak_ratio))
+
+            ele_up = np.linspace(start_ele, max_ele, peak_step)
+            ele_down = np.linspace(max_ele, end_ele, self.total_physics_steps - peak_step)
             self.trajectory_elevation = np.concatenate([ele_up, ele_down])
 
-            # Azimuth changes gradually
+            # Azimuth: wider range (45°~135° start, 45°~315° end)
             self.trajectory_azimuth = np.linspace(
-                self.rng.uniform(70, 90),
-                self.rng.uniform(90, 110),
-                self.max_steps
+                self.rng.uniform(45, 135),
+                self.rng.uniform(45, 315),
+                self.total_physics_steps
             )
 
         # Reset user positions for this episode
@@ -195,8 +211,6 @@ class ITSNEnv(gym.Env):
         # Initialize true G_SAT
         self.true_G_SAT = self.current_channels['G_SAT']
 
-        # = self.true_elevation + self.rng.normal(0, self   self.prev_obs_azimuth = self.true_azimuth + self.rng.normal(0, self.ephemeris_noise_std)
-
         # The 0 step obsevation:
         # Add ephemeris noise to observed angles
         obs_ele_0 = self.true_elevation + self.rng.normal(0, self.ephemeris_noise_std)
@@ -220,22 +234,27 @@ class ITSNEnv(gym.Env):
 
     def step(self, action):
         """
-        重构后的step函数，采用统一SINR计算，消除数据滞后。
-        使用 inferred G_SAT 进行 BS 波束成形决策，使用 true G_SAT 进行 P_sat 计算和评估。
+        Execute one RL step with n_substeps physics steps:
+        1. Update observation for current RL step
+        2. Make decision (Phi, W, P_sat) based on current observation
+        3. Evaluate performance over n_substeps with fixed decision
+        4. Satellite moves during substeps
+        5. Return averaged reward and next state
         """
-        # --- 1. 动作执行 (t时刻) ---
+        # --- 1. 动作执行 (固定整个RL step) ---
         action_clipped = np.clip(action, -1.0, 1.0)
         phase_indices = ((action_clipped + 1.0) / 2.0 * (self.num_phase_levels - 1)).astype(int)
         ris_phases = self.phase_codebook[np.clip(phase_indices, 0, self.num_phase_levels - 1)]
         Phi = np.diag(self.scenario.ris_amplitude_gain * np.exp(1j * ris_phases))
 
-        # --- 2. 生成 inferred G_SAT (基于噪声观测) ---
+        # --- 1.5. 更新当前observation (在决策前) ---
+        if self.current_step > 0:  # 第一步在reset中已更新
+            self._update_observation()
+
+        # --- 2. 决策阶段：基于更新后的 observation 计算 W 和 P_sat (只做一次) ---
         self.inferred_G_SAT = self._generate_inferred_G_SAT()
 
-        # --- 3. 混合优化 (t时刻) ---
-        # 此时 current_channels 是 t 时刻的真实信道
         try:
-            # A. 初步计算 BS 波束用于估计干扰 (使用 inferred G_SAT)
             H_eff_k, H_eff_j, H_sat_eff_k = self._get_all_eff_channels(
                 Phi, self.current_channels, G_SAT=self.inferred_G_SAT
             )
@@ -247,53 +266,78 @@ class ITSNEnv(gym.Env):
                 noise_power=self.scenario.P_noise, max_power=self.scenario.P_bs_max
             )
 
-            # B. 确定满足 SU 约束的最小 P_sat (使用 TRUE channels，因为要满足真实 SINR)
-            P_sat_t, _ = self.scenario.compute_sat_power(
+            P_sat_fixed, _ = self.scenario.compute_sat_power(
                 Phi, self.current_channels, W_bs=W_init, sinr_threshold_db=self.sinr_threshold_db
             )
 
-            # C. 确定最终的 BS 波束 W (使用 inferred G_SAT)
-            W, P_BS_norm, success, _ = compute_zf_waterfilling_baseline(
+            W_fixed, P_BS_norm, decision_success, _ = compute_zf_waterfilling_baseline(
                 H_eff_k, H_eff_j, H_sat_eff_k, self.current_channels['W_sat'],
-                P_sat=P_sat_t, P_bs_scale=self.scenario.P_bs_scale,
+                P_sat=P_sat_fixed, P_bs_scale=self.scenario.P_bs_scale,
                 sinr_threshold_linear=self.sinr_threshold_linear,
                 noise_power=self.scenario.P_noise, max_power=self.scenario.P_bs_max
             )
-            P_BS = self.scenario.P_bs_scale * P_BS_norm
-
-            # --- 核心：使用 TRUE channels 计算所有用户在 t 时刻的真实 SINR ---
-            all_sinr_values = self.calculate_all_sinrs(Phi, W, P_sat_t, self.current_channels)
+            P_BS_fixed = self.scenario.P_bs_scale * P_BS_norm
 
         except Exception:
-            success = False
-            P_BS, P_sat_t = 10.0, 10.0
-            all_sinr_values = np.zeros(self.scenario.K + 1)
+            decision_success = False
+            P_BS_fixed, P_sat_fixed = 10.0, 10.0
+            W_fixed = np.zeros((self.scenario.N_t, self.scenario.K), dtype=complex)
 
-        # --- 4. 奖励与快照 ---
-        reward = self._calculate_reward(P_BS, P_sat_t, all_sinr_values, success)
+        # --- 3. 评估阶段：用固定决策测量 n_substeps 的平均性能 ---
+        total_sinr_values = np.zeros(self.scenario.K + 1)
+        success_count = 0
 
-        # 记录快照 (注意：存入 prev 的是 t 时刻的真实性能反馈)
+        # 实际执行的substeps数量（可能少于n_substeps如果到达轨迹末尾）
+        actual_substeps = 0
+
+        for substep in range(self.n_substeps):
+            # 检查是否还有剩余physics steps
+            if self.current_physics_step >= self.total_physics_steps:
+                break
+
+            # 测量真实性能 (用固定的 Phi, W_fixed, P_sat_fixed)
+            all_sinr_values = self.calculate_all_sinrs(Phi, W_fixed, P_sat_fixed, self.current_channels)
+            total_sinr_values += all_sinr_values
+            actual_substeps += 1
+
+            # 检查是否满足约束
+            if np.all(all_sinr_values >= self.sinr_threshold_linear):
+                success_count += 1
+
+            # 物理演进：卫星移动到下一个physics step
+            self.current_physics_step += 1
+            if self.current_physics_step < self.total_physics_steps:
+                self._advance_physics()
+
+        # --- 4. 计算平均性能 ---
+        avg_sinr_values = total_sinr_values / max(actual_substeps, 1)  # 避免除零
+        avg_success = (actual_substeps > 0) and (success_count == actual_substeps)
+
+        # --- 5. 计算奖励 (基于平均性能) ---
+        reward = self._calculate_reward(P_BS_fixed, P_sat_fixed, avg_sinr_values, avg_success)
+
+        # --- 6. 更新快照 ---
         self.prev_Phi = Phi
-        self.prev_W_bs = W if success else np.zeros_like(W)
-        self.prev_sinr_values = all_sinr_values
+        self.prev_W_bs = W_fixed if decision_success else np.zeros_like(W_fixed)
+        self.prev_sinr_values = avg_sinr_values
         self.prev_obs_elevation = self.curr_obs_elevation
         self.prev_obs_azimuth = self.curr_obs_azimuth
 
-        # --- 5. 环境演进 (t -> t+1) ---
+        # --- 7. RL step 计数器更新 ---
         self.current_step += 1
-        terminated = self.current_step >= self.max_steps
-        if not terminated:
-            self._advance_physics() # 更新真实位置、CSI、W_sat
-            self._update_observation() # 产生 t+1 时刻噪声观测
+        # 终止条件：达到最大RL步数 或 物理步数耗尽
+        terminated = (self.current_step >= self.max_steps) or (self.current_physics_step >= self.total_physics_steps)
 
-        # --- 6. 获取 s_{t+1} ---
+        # --- 8. 获取 s_{t+1} ---
         state = self._get_state()
 
-        # --- 7. 构建 info dict (包含星历误差跟踪) ---
+        # --- 9. 构建 info dict ---
         info = {
-            "success": success,
-            "P_BS": P_BS,
-            "P_sat": P_sat_t,
+            "success": avg_success,
+            "success_rate": success_count / max(actual_substeps, 1),
+            "P_BS": P_BS_fixed,
+            "P_sat": P_sat_fixed,
+            "actual_substeps": actual_substeps,
             # Ephemeris uncertainty tracking
             "true_elevation": self.true_elevation,
             "true_azimuth": self.true_azimuth,
@@ -303,9 +347,9 @@ class ITSNEnv(gym.Env):
             "ephemeris_error_azi": self.curr_obs_azimuth - self.true_azimuth,
             # G_SAT mismatch tracking
             "G_SAT_mismatch": np.linalg.norm(self.true_G_SAT - self.inferred_G_SAT),
-            # SINR values
-            "sinr_UE": all_sinr_values[:self.scenario.K],
-            "sinr_SUE": all_sinr_values[self.scenario.K]
+            # SINR values (averaged)
+            "sinr_UE": avg_sinr_values[:self.scenario.K],
+            "sinr_SUE": avg_sinr_values[self.scenario.K]
         }
 
         return state, reward, terminated, False, info
@@ -313,21 +357,22 @@ class ITSNEnv(gym.Env):
     def _calculate_reward(self, P_BS, P_sat, all_sinr_values, success):
         """
         综合考虑系统总能耗和所有用户 (K+1) 的 SINR 满足情况 [cite: 83, 87, 168]
+        使用线性尺度的 SINR gap 以提供更平滑的梯度
         """
         # 1. 能效奖励：最小化系统总功耗 [cite: 168]
         total_p = P_BS + P_sat
         reward_energy = -10 * np.log10(total_p + 1e-6)
 
-        # 2. SINR 约束检查 (K 个 UE + 1 个 SU)
-        sinr_db = 10 * np.log10(all_sinr_values + 1e-12)
-        # 计算每个用户相对于阈值的违规量 [cite: 169]
-        violations = np.maximum(0, (self.sinr_threshold_db - sinr_db))
-        penalty_sinr = -self.sinr_penalty_weight * np.sum(violations)
+        # 2. SINR 约束检查 (K 个 UE + 1 个 SU) - 线性尺度
+        # 计算每个用户相对于阈值的违规量（线性尺度提供更平滑梯度）
+        sinr_gaps = np.maximum(0, self.sinr_threshold_linear - all_sinr_values)
+        normalized_gaps = sinr_gaps / (self.sinr_threshold_linear + 1e-12)
+        penalty_sinr = -self.sinr_penalty_weight * np.sum(normalized_gaps)
 
         # 3. 综合奖励
-        # 如果所有约束满足 (success=True 且 violations=0)，给予额外奖励
-        bonus_all_satisfied = 5.0 if success and np.all(violations <= 1e-3) else 0.0
-        
+        # 如果所有约束满足 (success=True 且 gaps=0)，给予额外奖励
+        bonus_all_satisfied = 5.0 if success and np.all(sinr_gaps <= 1e-6) else 0.0
+
         return reward_energy + penalty_sinr + bonus_all_satisfied
 
 
@@ -486,8 +531,8 @@ class ITSNEnv(gym.Env):
         Updates true_elevation, true_azimuth, and regenerates true channels.
         """
         # Update true position from trajectory
-        self.true_elevation = self.trajectory_elevation[self.current_step]
-        self.true_azimuth = self.trajectory_azimuth[self.current_step]
+        self.true_elevation = self.trajectory_elevation[self.current_physics_step]
+        self.true_azimuth = self.trajectory_azimuth[self.current_physics_step]
 
         # Update scenario with TRUE position
         self.scenario.update_satellite_position(

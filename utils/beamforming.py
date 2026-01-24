@@ -223,12 +223,12 @@ def compute_zf_waterfilling_baseline(H_eff_k, H_eff_j, H_sat_eff_k, W_sat, P_sat
         # Check rank
         rank_H = np.linalg.matrix_rank(H_combine)
         if rank_H < K + J:
-            reg_factor = 1e-6 * np.eye(K + J)
+            reg_factor = 1e-10 * np.eye(K + J)
         else:
-            reg_factor = 1e-6 * np.eye(K + J)
+            reg_factor = 1e-12 * np.eye(K + J)
 
         # Compute ZF weights: W = H (H^H H)^{-1}
-        w_all = H_combine @ np.linalg.inv(HHH)  # (N_t, K+J)
+        w_all = H_combine @ np.linalg.inv(HHH+reg_factor)  # (N_t, K+J)
 
         # Extract BS users' beamforming and normalize
         w = w_all[:, :K]  # (N_t, K)
