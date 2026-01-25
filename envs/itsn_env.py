@@ -384,14 +384,11 @@ class ITSNEnv(gym.Env):
 
     def _calculate_reward_weighted_rate(self, P_BS, P_sat, all_sinr_values, success):
         """
-        基于加权和速率的奖励函数
+        分层Reward设计 (方案3):
 
-        Reward = Σ(weight_i * rate_i) - penalty
-
-        其中:
-        - rate_i = log2(1 + SINR_i) (Shannon capacity, bps/Hz)
-        - weight: 卫星用户=8, 基站用户=1
-        - penalty: SINR低于(10-0.2)dB时施加惩罚
+        Layer 1 (必须满足): SINR约束 - 不满足则严重惩罚
+        Layer 2 (主目标): 功耗最小化 - 归一化到[0,1]
+        Layer 3 (辅助信号): SINR余量bonus - 引导找到更好的RIS相位
 
         Args:
             P_BS: BS功率 (W)
@@ -400,36 +397,42 @@ class ITSNEnv(gym.Env):
             success: 是否所有用户满足SINR约束
 
         Returns:
-            reward: 加权和速率 (bps/Hz)
+            reward: 分层奖励值
         """
-        # 1. 计算各用户速率 (Shannon capacity)
-        # rate = log2(1 + SINR), 单位: bps/Hz
-        rates = np.log2(1 + all_sinr_values)
+        # Layer 1: SINR约束检查 (硬约束)
+        sinr_threshold_db = 9.8  # 10 - 0.2 dB
+        sinr_threshold_linear = 10 ** (sinr_threshold_db / 10.0)
 
-        # 2. 设置权重: 前K个是BS用户(权重=1), 最后1个是卫星用户(权重=8)
-        weights = np.ones(self.scenario.K + 1)
-        weights[-1] = 8.0  # 卫星用户权重
+        sinr_gaps = np.maximum(0, sinr_threshold_linear - all_sinr_values)
+        constraint_violated = np.any(sinr_gaps > 0)
 
-        # 3. 加权和速率
-        weighted_sum_rate = np.sum(weights * rates)
+        if constraint_violated:
+            # 严重惩罚，但给出改进方向（gap越大惩罚越重）
+            normalized_gaps = sinr_gaps / (sinr_threshold_linear + 1e-12)
+            return -10.0 - 5.0 * np.sum(normalized_gaps)
 
-        # 4. SINR惩罚: 低于(10-0.2)=9.8dB时施加惩罚
-        sinr_threshold_penalty_db = 9.8
-        sinr_threshold_penalty_linear = 10 ** (sinr_threshold_penalty_db / 10.0)
+        # --- 以下只有满足SINR约束才执行 ---
 
-        # 计算违规量 (线性尺度)
-        sinr_violations = np.maximum(0, sinr_threshold_penalty_linear - all_sinr_values)
+        # Layer 2: 功耗最小化 (主目标)
+        # 归一化到[0, 1]范围，功耗越低reward越高
+        total_power = P_BS + P_sat
+        max_power = self.scenario.P_bs_max + self.scenario.P_sat_max  # 10 + 100 = 110W
+        min_power = 0.1  # 假设最小功耗0.1W
 
-        # 归一化违规量并加权
-        normalized_violations = sinr_violations / (sinr_threshold_penalty_linear + 1e-12)
-        weighted_violations = weights * normalized_violations
+        # 功耗reward: 功耗越低越好
+        # power_ratio ∈ [0, 1], 0表示最小功耗, 1表示最大功耗
+        power_ratio = np.clip((total_power - min_power) / (max_power - min_power), 0, 1)
+        power_reward = 1.0 - power_ratio  # [0, 1], 越高越好
 
-        # 惩罚系数 (可调)
-        penalty_weight = 10.0
-        penalty = -penalty_weight * np.sum(weighted_violations)
+        # Layer 3: SINR余量bonus (辅助信号)
+        # 超过阈值的部分给予小bonus，引导Agent找到更好的RIS相位
+        # sinr_margin = (SINR - threshold) / threshold, 限制在[0, 1]
+        sinr_margin = np.clip(all_sinr_values / sinr_threshold_linear - 1.0, 0, 1.0)
+        margin_bonus = 0.1 * np.mean(sinr_margin)  # 小权重，避免喧宾夺主
 
-        # 5. 总奖励
-        reward = weighted_sum_rate + penalty
+        # 综合Reward
+        # 主要由功耗决定，SINR余量作为辅助
+        reward = 10.0 * power_reward + margin_bonus
 
         return reward
 
