@@ -49,9 +49,9 @@ def make_env(ae_checkpoint_path, rank, seed=0, device='cuda', **env_kwargs):
 def train_rl_agent(
     ae_checkpoint_path,
     total_timesteps=500000,
-    n_envs=4,
+    n_envs=16,
     learning_rate=3e-4,
-    n_steps=2048,
+    n_steps=64,
     batch_size=64,
     n_epochs=10,
     gamma=0.99,
@@ -214,8 +214,10 @@ def main():
     # Training parameters
     parser.add_argument('--total-timesteps', type=int, default=500000,
                        help='Total training timesteps')
-    parser.add_argument('--n-envs', type=int, default=4,
-                       help='Number of parallel environments')
+    parser.add_argument('--n-envs', type=int, default=16,
+                       help='Number of parallel environments (recommended: 16-32 for episode_length=40)')
+    parser.add_argument('--n-steps', type=int, default=64,
+                       help='Steps per environment per update (recommended: 64-128 for episode_length=40)')
     parser.add_argument('--learning-rate', type=float, default=3e-4,
                        help='Learning rate')
     parser.add_argument('--seed', type=int, default=42,
