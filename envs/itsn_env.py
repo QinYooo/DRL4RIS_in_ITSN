@@ -320,7 +320,8 @@ class ITSNEnv(gym.Env):
         avg_success = (actual_substeps > 0) and (success_count == actual_substeps)
 
         # --- 5. 计算奖励 (基于平均性能) ---
-        reward = self._calculate_reward(P_BS_fixed, P_sat_fixed, avg_sinr_values, avg_success)
+        # 使用加权和速率作为奖励
+        reward = self._calculate_reward_weighted_rate(P_BS_fixed, P_sat_fixed, avg_sinr_values, avg_success)
 
         # --- 6. 更新快照 ---
         self.prev_Phi = Phi
@@ -380,6 +381,57 @@ class ITSNEnv(gym.Env):
         bonus_all_satisfied = 5.0 if success and np.all(sinr_gaps <= 1e-6) else 0.0
 
         return reward_energy + penalty_sinr + bonus_all_satisfied
+
+    def _calculate_reward_weighted_rate(self, P_BS, P_sat, all_sinr_values, success):
+        """
+        基于加权和速率的奖励函数
+
+        Reward = Σ(weight_i * rate_i) - penalty
+
+        其中:
+        - rate_i = log2(1 + SINR_i) (Shannon capacity, bps/Hz)
+        - weight: 卫星用户=8, 基站用户=1
+        - penalty: SINR低于(10-0.2)dB时施加惩罚
+
+        Args:
+            P_BS: BS功率 (W)
+            P_sat: 卫星功率 (W)
+            all_sinr_values: 所有用户SINR (线性尺度), shape=(K+1,)
+            success: 是否所有用户满足SINR约束
+
+        Returns:
+            reward: 加权和速率 (bps/Hz)
+        """
+        # 1. 计算各用户速率 (Shannon capacity)
+        # rate = log2(1 + SINR), 单位: bps/Hz
+        rates = np.log2(1 + all_sinr_values)
+
+        # 2. 设置权重: 前K个是BS用户(权重=1), 最后1个是卫星用户(权重=8)
+        weights = np.ones(self.scenario.K + 1)
+        weights[-1] = 8.0  # 卫星用户权重
+
+        # 3. 加权和速率
+        weighted_sum_rate = np.sum(weights * rates)
+
+        # 4. SINR惩罚: 低于(10-0.2)=9.8dB时施加惩罚
+        sinr_threshold_penalty_db = 9.8
+        sinr_threshold_penalty_linear = 10 ** (sinr_threshold_penalty_db / 10.0)
+
+        # 计算违规量 (线性尺度)
+        sinr_violations = np.maximum(0, sinr_threshold_penalty_linear - all_sinr_values)
+
+        # 归一化违规量并加权
+        normalized_violations = sinr_violations / (sinr_threshold_penalty_linear + 1e-12)
+        weighted_violations = weights * normalized_violations
+
+        # 惩罚系数 (可调)
+        penalty_weight = 10.0
+        penalty = -penalty_weight * np.sum(weighted_violations)
+
+        # 5. 总奖励
+        reward = weighted_sum_rate + penalty
+
+        return reward
 
 
     def _initialize_with_zf_waterfilling(self):
