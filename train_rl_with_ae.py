@@ -227,8 +227,8 @@ def main():
                        help='Device to use')
 
     # Environment parameters
-    parser.add_argument('--max-steps', type=int, default=40,
-                       help='Max steps per episode')
+    parser.add_argument('--max-steps', type=int, default=64,
+                       help='Max steps per episode (should match n_steps for 1 episode per rollout)')
     parser.add_argument('--n-substeps', type=int, default=5,
                        help='Physics substeps per RL step')
     parser.add_argument('--phase-bits', type=int, default=4,

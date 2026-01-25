@@ -142,9 +142,15 @@ class ITSNEnv(gym.Env):
         """
         super().reset(seed=seed)
 
+        # Update RNG for trajectory diversity
         if seed is not None:
             self.rng = np.random.RandomState(seed)
             self.scenario = ITSNScenario(rng_seed=seed)
+        else:
+            # Generate new random seed for diversity when seed not specified
+            new_seed = np.random.randint(0, 1000000)
+            self.rng = np.random.RandomState(new_seed)
+            self.scenario = ITSNScenario(rng_seed=new_seed)
 
         # Reset step counters
         self.current_step = 0  # RL step
