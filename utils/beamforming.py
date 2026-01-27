@@ -233,22 +233,24 @@ def compute_zf_waterfilling_baseline(H_eff_k, H_eff_j, H_sat_eff_k, W_sat, P_sat
         # Extract BS users' beamforming and normalize
         w = w_all[:, :K]  # (N_t, K)
         w = w / (np.linalg.norm(w, 'fro'))
+        # 取共轭使得后续计算为 h @ w 而非 h.conj() @ w
+        w = w.conj()
 
         # Step 2: Iterative power allocation
         p = np.zeros(K)
         for k in range(K):
             # Signal power (before power scaling)
-            signal_power = P_bs_scale * np.abs(H_eff_k[k].conj() @ w[:, k]) ** 2
+            signal_power = P_bs_scale * np.abs(H_eff_k[k] @ w[:, k]) ** 2
 
             # Interference from other BS users
             interference = 0
             for m in range(K):
                 if m != k:
-                    interference += P_bs_scale * np.abs(H_eff_k[k].conj() @ w[:, m]) ** 2
+                    interference += P_bs_scale * np.abs(H_eff_k[k] @ w[:, m]) ** 2
 
-            # Interference from satellite
+            # Interference from satellite (W_sat = h.T, 所以用 h^* @ W_sat)
             for j in range(J):
-                interference += P_sat * np.abs(H_sat_eff_k[k].conj() @ W_sat[:, j]) ** 2
+                interference += P_sat * np.abs(H_sat_eff_k[k] @ W_sat[:, j]) ** 2
 
             # Required power coefficient: p[k] = gamma * (interference + noise) / signal
             p[k] = max(sinr_threshold_linear * (interference + noise_power) / (signal_power + 1e-20), 0)
@@ -275,13 +277,13 @@ def compute_zf_waterfilling_baseline(H_eff_k, H_eff_j, H_sat_eff_k, W_sat, P_sat
         # Step 5: Compute actual SINR
         sinr_values = np.zeros(K)
         for k in range(K):
-            signal = P_bs_scale * np.abs(H_eff_k[k].conj() @ W[:, k]) ** 2
+            signal = P_bs_scale * np.abs(H_eff_k[k] @ W[:, k]) ** 2
             interference = noise_power
             for m in range(K):
                 if m != k:
-                    interference += P_bs_scale * np.abs(H_eff_k[k].conj() @ W[:, m]) ** 2
+                    interference += P_bs_scale * np.abs(H_eff_k[k] @ W[:, m]) ** 2
             for j in range(J):
-                interference += P_sat * np.abs(H_sat_eff_k[k].conj() @ W_sat[:, j]) ** 2
+                interference += P_sat * np.abs(H_sat_eff_k[k] @ W_sat[:, j]) ** 2
             sinr_values[k] = signal / interference
 
         info = {

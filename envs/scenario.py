@@ -9,7 +9,7 @@ class ITSNScenario:
         # 系统规模
         self.K = 4       # BS users
         self.SK = 1      # SAT users
-        self.N_t = 36    # BS transmit antennas (URA 6x6)
+        self.N_t = 36    # BS transmit antennas (URA 8x8)
         self.N_r = 1     # User receive antennas
         self.N_sat = 64  # Satellite antennas (URA 8x8)
         self.N_ris = 100 # RIS elements (URA 10x10)
@@ -31,7 +31,7 @@ class ITSNScenario:
         # 路径损耗与衰落参数
         self.P0_dB = -30
         self.BETA_r = 10**(20/10) # Rician factor for RIS links
-        self.BETA_d = 10**(6/10)  # Rician factor for Direct links
+        self.BETA_d = 10**(10/10)  # Rician factor for Direct links (提高到10dB)
         self.BETA_SAT = 10**(6/10)
         self.alpha_terrestrial = 3.75 # 地面链路路损指数
         self.alpha_ris = 2.0          # RIS相关链路路损指数
@@ -47,7 +47,7 @@ class ITSNScenario:
 
         # 最大功率预算 (用于约束)
         self.P_bs_max = 10.0  # 基站最大功率 10W
-        self.P_sat_max = 100.0  # 卫星最大功率 100W
+        self.P_sat_max = 20.0  # 卫星最大功率 20W (降低以减少RIS相位不良时的跳变)
         
         # 位置坐标 (单位: m) - 与MATLAB Prepare_parameter.m一致
         self.BS_POS = np.array([0, 0, 10])
@@ -64,7 +64,11 @@ class ITSNScenario:
 
         # 初始化位置
         self.reset_user_positions()
-        
+
+        # 初始化NLOS缓存（慢衰落，episode内不变）
+        self._nlos_cache = {}
+        self._generate_nlos_cache()
+
         # 初始化卫星 (默认位置)
         self.update_satellite_position(ele=40, azi=80)
 
@@ -106,6 +110,44 @@ class ITSNScenario:
             offset + 20 * np.random.rand(self.SK, 2),
             np.zeros(self.SK)
         ))
+
+    def _generate_nlos_cache(self):
+        """
+        生成并缓存NLOS分量（模拟慢衰落，episode内保持不变）
+        """
+        self._nlos_cache = {
+            # BS -> UE (K个用户，每个N_t维)
+            'H_BS2UE': [(np.random.randn(self.N_t) + 1j * np.random.randn(self.N_t)) / np.sqrt(2)
+                        for _ in range(self.K)],
+            # BS -> SUE (SK个用户，每个N_t维)
+            'H_BS2SUE': [(np.random.randn(self.N_t) + 1j * np.random.randn(self.N_t)) / np.sqrt(2)
+                         for _ in range(self.SK)],
+            # RIS -> UE (K个用户，每个N_ris维)
+            'H_RIS2UE': [(np.random.randn(self.N_ris) + 1j * np.random.randn(self.N_ris)) / np.sqrt(2)
+                         for _ in range(self.K)],
+            # RIS -> SUE (SK个用户，每个N_ris维)
+            'H_RIS2SUE': [(np.random.randn(self.N_ris) + 1j * np.random.randn(self.N_ris)) / np.sqrt(2)
+                          for _ in range(self.SK)],
+        }
+
+    def update_nlos_cache(self, alpha):
+        """
+        使用一阶高斯-马尔可夫模型更新NLOS缓存
+        g_{t+1} = alpha * g_t + sqrt(1 - alpha^2) * w_t, w_t ~ CN(0,1)
+
+        Args:
+            alpha: 相关系数，alpha = J_0(2*pi*f_D*delta_t)
+        """
+        if not self._nlos_cache:
+            return
+
+        sqrt_term = np.sqrt(1 - alpha**2)
+
+        for key in self._nlos_cache:
+            for i in range(len(self._nlos_cache[key])):
+                dim = self._nlos_cache[key][i].shape[0]
+                w = (np.random.randn(dim) + 1j * np.random.randn(dim)) / np.sqrt(2)
+                self._nlos_cache[key][i] = alpha * self._nlos_cache[key][i] + sqrt_term * w
 
     def update_satellite_position(self, ele, azi, orbit_height=500e3):
         """
@@ -207,10 +249,12 @@ class ITSNScenario:
             # 使用URA导引向量
             pl_linear = np.sqrt(self.db2pow(self.P0_dB - 10 * self.alpha_terrestrial * np.log10(dist_BS2UE[k])))
             h_los = self._get_ura_response(self.N_t, ele_bs, azi_bs)
-            h_nlos = (np.random.randn(self.N_t) + 1j * np.random.randn(self.N_t)) / np.sqrt(2)
-
-            beta = self.BETA_d
-            h_combined = np.sqrt(beta/(beta+1)) * h_los + np.sqrt(1/(beta+1)) * h_nlos
+            # Rician信道: LOS + NLOS（无缓存时即时生成）
+            if 'H_BS2UE' in self._nlos_cache:
+                h_nlos = self._nlos_cache['H_BS2UE'][k]
+            else:
+                h_nlos = (np.random.randn(self.N_t) + 1j * np.random.randn(self.N_t)) / np.sqrt(2)
+            h_combined = np.sqrt(self.BETA_d / (1 + self.BETA_d)) * h_los + np.sqrt(1 / (1 + self.BETA_d)) * h_nlos
             # 使用共轭形式
             H_BS2UE[k, :] = pl_linear * h_combined.conj()
 
@@ -234,10 +278,12 @@ class ITSNScenario:
             # 使用URA导引向量
             pl_linear = np.sqrt(self.db2pow(self.P0_dB - 10 * self.alpha_terrestrial * np.log10(dist_BS2SUE[k])))
             h_los = self._get_ura_response(self.N_t, ele_bs, azi_bs)
-            h_nlos = (np.random.randn(self.N_t) + 1j * np.random.randn(self.N_t)) / np.sqrt(2)
-
-            beta = self.BETA_d
-            h_combined = np.sqrt(beta/(beta+1)) * h_los + np.sqrt(1/(beta+1)) * h_nlos
+            # Rician信道: LOS + NLOS（无缓存时即时生成）
+            if 'H_BS2SUE' in self._nlos_cache:
+                h_nlos = self._nlos_cache['H_BS2SUE'][k]
+            else:
+                h_nlos = (np.random.randn(self.N_t) + 1j * np.random.randn(self.N_t)) / np.sqrt(2)
+            h_combined = np.sqrt(self.BETA_d / (1 + self.BETA_d)) * h_los + np.sqrt(1 / (1 + self.BETA_d)) * h_nlos
             # 使用共轭形式
             H_BS2SUE[k, :] = pl_linear * h_combined.conj()
 
@@ -348,17 +394,19 @@ class ITSNScenario:
             ele = np.abs(np.degrees(np.arctan2(dx, np.sqrt(dy**2 + dz**2))))
 
             a_ris_aod = self._get_ura_response(self.N_ris, ele, azi)
-            h_nlos = (np.random.randn(self.N_ris) + 1j * np.random.randn(self.N_ris)) / np.sqrt(2)
-
-            beta = self.BETA_r
-            h_comb = np.sqrt(beta/(beta+1))*a_ris_aod + np.sqrt(1/(beta+1))*h_nlos
+            # Rician信道: LOS + NLOS（无缓存时即时生成）
+            if 'H_RIS2UE' in self._nlos_cache:
+                h_nlos = self._nlos_cache['H_RIS2UE'][k]
+            else:
+                h_nlos = (np.random.randn(self.N_ris) + 1j * np.random.randn(self.N_ris)) / np.sqrt(2)
+            h_comb = np.sqrt(self.BETA_r / (1 + self.BETA_r)) * a_ris_aod + np.sqrt(1 / (1 + self.BETA_r)) * h_nlos
 
             pl_lin = np.sqrt(self.db2pow(self.P0_dB - 10 * self.alpha_ris * np.log10(dist_UE2RIS[k])))
             # 使用共轭形式
             H_RIS2UE[k, :] = pl_lin * h_comb.conj()
 
         channels['H_RIS2UE'] = H_RIS2UE
-        
+
         # ----------------------------------------------------------------
         # 8. RIS -> SUE (SK x N_ris)
         # 使用共轭形式
@@ -372,10 +420,12 @@ class ITSNScenario:
             ele = np.abs(np.degrees(np.arctan2(dx, np.sqrt(dy**2 + dz**2))))
 
             a_ris_aod = self._get_ura_response(self.N_ris, ele, azi)
-            h_nlos = (np.random.randn(self.N_ris) + 1j * np.random.randn(self.N_ris)) / np.sqrt(2)
-
-            beta = self.BETA_r
-            h_comb = np.sqrt(beta/(beta+1))*a_ris_aod + np.sqrt(1/(beta+1))*h_nlos
+            # Rician信道: LOS + NLOS（无缓存时即时生成）
+            if 'H_RIS2SUE' in self._nlos_cache:
+                h_nlos = self._nlos_cache['H_RIS2SUE'][k]
+            else:
+                h_nlos = (np.random.randn(self.N_ris) + 1j * np.random.randn(self.N_ris)) / np.sqrt(2)
+            h_comb = np.sqrt(self.BETA_r / (1 + self.BETA_r)) * a_ris_aod + np.sqrt(1 / (1 + self.BETA_r)) * h_nlos
 
             pl_lin = np.sqrt(self.db2pow(self.P0_dB - 10 * self.alpha_ris * np.log10(dist_SUE2RIS[k])))
             # 使用共轭形式
@@ -389,7 +439,7 @@ class ITSNScenario:
         # 卫星波束成形应指向卫星用户，而不是原点
         # 使用第一个卫星用户的位置作为波束指向
         # 注意：W_sat 归一化到单位 Frobenius 范数，实际发射功率由 P_sat 控制
-        W_sat_raw = H_SAT2SUE.T
+        W_sat_raw = H_SAT2SUE.conj().T
         # 归一化到单位 Frobenius 范数 (与 evaluate_baseline.py 一致)
         W_sat = W_sat_raw / (np.linalg.norm(W_sat_raw, 'fro'))
         channels['W_sat'] = W_sat  # Column vector, ||W_sat||_F = 1
@@ -404,7 +454,8 @@ class ITSNScenario:
         SNR_target_linear = self.db2pow(SNR_target_dB)
 
         # 计算直接路径信道增益 (不考虑RIS，因为初始时Phi未知)
-        channel_gain = np.linalg.norm(H_SAT2SUE.conj() @ W_sat) ** 2
+        # W_sat = H_SAT2SUE.conj().T，所以用 h @ w
+        channel_gain = np.linalg.norm(H_SAT2SUE @ W_sat) ** 2
 
         # 计算所需功率：P_sat = SNR_target * sigma2 / channel_gain
         P_sat_required = SNR_target_linear * self.P_noise / (channel_gain)
@@ -453,20 +504,35 @@ class ITSNScenario:
         H_BS2SUE = channels['H_BS2SUE']    # (SK, N_t)
 
         # 计算卫星到卫星用户的等效信道 (包含RIS反射路径)
-        # h_sat_eff = H_SAT2SUE @ W_sat + H_RIS2SUE @ Phi @ G_SAT @ W_sat
-        h_direct = H_SAT2SUE @ W_sat  # (SK, 1) 直接路径
-        h_ris = H_RIS2SUE @ Phi @ G_SAT @ W_sat  # (SK, 1) RIS反射路径
-        h_sat_eff = h_direct + h_ris  # (SK, 1) 等效信道
+        # H_sat_eff = H_SAT2SUE + H_RIS2SUE @ Phi @ G_SAT  (SK, N_sat)
+        H_sat_eff = H_SAT2SUE + H_RIS2SUE @ Phi @ G_SAT  # (SK, N_sat)
 
-        # 卫星用户的等效信道增益 |h_sat_eff|^2
-        sat_channel_gain = np.abs(h_sat_eff.flatten()) ** 2  # (SK,)
+        # 计算每个卫星用户的信号功率: |h_k^H @ w_sat|^2
+        # W_sat = h.T (因为 H_SAT2SUE 存储的是 h^*)，所以用 h^* @ W_sat
+        sat_channel_gain = np.zeros(self.SK)
+        for k in range(self.SK):
+            # signal = |h^* @ w_sat|^2 = |h^* @ h.T|^2 = ||h||^4
+            sat_channel_gain[k] = np.abs(H_sat_eff[k, :] @ W_sat.flatten()) ** 2
 
-        # 计算BS对卫星用户的干扰
+        # 用于调试输出 (保留旧的计算方式用于对比)
+        h_direct = H_SAT2SUE @ W_sat  # (SK, 1)
+        h_ris = H_RIS2SUE @ Phi @ G_SAT @ W_sat  # (SK, 1)
+
+        # 计算BS对卫星用户的干扰 (需要考虑RIS反射路径!)
+        # H_eff_sue = H_BS2SUE + H_RIS2SUE @ Phi @ G_BS
+        G_BS = channels['G_BS']  # (N_ris, N_t)
+        H_eff_sue = H_BS2SUE + H_RIS2SUE @ Phi @ G_BS  # (SK, N_t)
+
         bs_interference = np.zeros(self.SK)
         if W_bs is not None:
-            # I_bs = sum_k |h_bs2sue @ w_k|^2 * P_bs_scale
+            # I_bs = sum_k |h_eff_sue^H @ w_k|^2 * P_bs_scale
+            # W_bs 已经取共轭，所以用 h @ w
             for k in range(self.SK):
-                bs_interference[k] = self.P_bs_scale * np.sum(np.abs(H_BS2SUE[k, :] @ W_bs) ** 2)
+                # 对每个BS用户的波束成形向量计算干扰
+                interf_sum = 0.0
+                for j in range(W_bs.shape[1]):  # 遍历所有BS用户
+                    interf_sum += np.abs(H_eff_sue[k, :] @ W_bs[:, j]) ** 2
+                bs_interference[k] = self.P_bs_scale * interf_sum
 
         # 计算满足SINR约束的最小卫星功率
         # SINR_sat = P_sat * |h_sat_eff|^2 / (I_bs + noise) >= threshold

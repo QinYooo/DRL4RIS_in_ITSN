@@ -34,10 +34,12 @@ class ITSNEnv(gym.Env):
                  n_substeps=1,  # Number of physics substeps per RL step
                  phase_bits=4,  # 1-bit or 2-bit quantization
                  sinr_threshold_db=10.0,  # Minimum SINR requirement
-                 sinr_penalty_weight=100.0,
+                 sinr_penalty_weight=10.0,
                  ephemeris_noise_std=0.5,  # Degrees of angle noise
                  rate_requirement_bps=1e6,  # Rate constraint per user
-                 orbit_height=500e3):
+                 orbit_height=500e3,
+                 orbit_duration=600.0,  # 轨道总时间(秒)，默认10分钟
+                 coherence_time=0.1):  # 相干时间(秒)，经验值
 
         super().__init__()
 
@@ -52,6 +54,13 @@ class ITSNEnv(gym.Env):
         self.current_step = 0  # RL step counter
         self.current_physics_step = 0  # Physics step counter
         self.orbit_height = orbit_height
+
+        # 时间参数 (用于NLOS高斯-马尔可夫更新)
+        self.orbit_duration = orbit_duration
+        self.coherence_time = coherence_time
+        self.step_duration = orbit_duration / max_steps_per_episode  # 每RL step时长
+        # alpha = J_0(2*pi*f_D*delta_t), 简化为 exp(-delta_t / T_c)
+        self.nlos_alpha = np.exp(-self.step_duration / coherence_time)
 
         # RIS quantization
         self.phase_bits = phase_bits
@@ -194,6 +203,8 @@ class ITSNEnv(gym.Env):
 
         # Reset user positions for this episode
         self.scenario.reset_user_positions()
+        # 暂时禁用NLOS缓存以验证
+        # self.scenario._generate_nlos_cache()
 
         # Reset RIS phase to identity (starting point for each episode)
         self.initial_ris_phase = self.scenario.ris_amplitude_gain * np.eye(self.scenario.N_ris, dtype=complex)
@@ -248,9 +259,9 @@ class ITSNEnv(gym.Env):
         5. Return averaged reward and next state
         """
         # --- 1. 动作执行 (固定整个RL step) ---
+        # 连续相移：将动作 [-1, 1] 映射到 [-π, π]，使得 action=0 对应 phase=0
         action_clipped = np.clip(action, -1.0, 1.0)
-        phase_indices = ((action_clipped + 1.0) / 2.0 * (self.num_phase_levels - 1)).astype(int)
-        ris_phases = self.phase_codebook[np.clip(phase_indices, 0, self.num_phase_levels - 1)]
+        ris_phases = action_clipped * np.pi  # [-1,1] -> [-π, π]
         Phi = np.diag(self.scenario.ris_amplitude_gain * np.exp(1j * ris_phases))
 
         # --- 1.5. 更新当前observation (在决策前) ---
@@ -262,29 +273,23 @@ class ITSNEnv(gym.Env):
 
         try:
             H_eff_k, H_eff_j, H_sat_eff_k = self._get_all_eff_channels(
-                Phi, self.current_channels, G_SAT=self.inferred_G_SAT
+                Phi, self.current_channels
             )
 
-            W_init, _, _, _ = compute_zf_waterfilling_baseline(
+            W_fixed, P_BS_norm, decision_success, _ = compute_zf_waterfilling_baseline(
                 H_eff_k, H_eff_j, H_sat_eff_k, self.current_channels['W_sat'],
-                P_sat=self.scenario.P_sat, P_bs_scale=self.scenario.P_bs_scale,
+                P_sat=self.prev_P_sat, P_bs_scale=self.scenario.P_bs_scale,
                 sinr_threshold_linear=self.sinr_threshold_linear,
                 noise_power=self.scenario.P_noise, max_power=self.scenario.P_bs_max
             )
 
             P_sat_fixed, _ = self.scenario.compute_sat_power(
-                Phi, self.current_channels, W_bs=W_init, sinr_threshold_db=self.sinr_threshold_db
+                Phi, self.current_channels, W_bs=W_fixed, sinr_threshold_db=self.sinr_threshold_db
             )
 
-            W_fixed, P_BS_norm, decision_success, _ = compute_zf_waterfilling_baseline(
-                H_eff_k, H_eff_j, H_sat_eff_k, self.current_channels['W_sat'],
-                P_sat=P_sat_fixed, P_bs_scale=self.scenario.P_bs_scale,
-                sinr_threshold_linear=self.sinr_threshold_linear,
-                noise_power=self.scenario.P_noise, max_power=self.scenario.P_bs_max
-            )
             P_BS_fixed = self.scenario.P_bs_scale * P_BS_norm
 
-        except Exception:
+        except Exception as e:
             decision_success = False
             P_BS_fixed, P_sat_fixed = 10.0, 10.0
             W_fixed = np.zeros((self.scenario.N_t, self.scenario.K), dtype=complex)
@@ -306,8 +311,9 @@ class ITSNEnv(gym.Env):
             total_sinr_values += all_sinr_values
             actual_substeps += 1
 
-            # 检查是否满足约束
-            if np.all(all_sinr_values >= self.sinr_threshold_linear):
+            # 检查是否满足约束 (留0.2dB余量)
+            soft_threshold = 10 ** ((self.sinr_threshold_db - 0.4) / 10.0)
+            if np.all(all_sinr_values >= soft_threshold):
                 success_count += 1
 
             # 物理演进：卫星移动到下一个physics step
@@ -315,20 +321,28 @@ class ITSNEnv(gym.Env):
             if self.current_physics_step < self.total_physics_steps:
                 self._advance_physics()
 
+        # --- 3.5 更新NLOS缓存 (高斯-马尔可夫模型，为下一step准备) ---
+        self.scenario.update_nlos_cache(self.nlos_alpha)
+        # 重新生成channels以应用新的NLOS
+        self.current_channels = self.scenario.generate_channels()
+
         # --- 4. 计算平均性能 ---
         avg_sinr_values = total_sinr_values / max(actual_substeps, 1)  # 避免除零
         avg_success = (actual_substeps > 0) and (success_count == actual_substeps)
 
         # --- 5. 计算奖励 (基于平均性能) ---
         # 使用加权和速率作为奖励
-        reward = self._calculate_reward_weighted_rate(P_BS_fixed, P_sat_fixed, avg_sinr_values, avg_success)
+        reward = self._calculate_reward(P_BS_fixed, P_sat_fixed*np.linalg.norm(self.current_channels['W_sat'],'fro'), avg_sinr_values, avg_success)
 
         # --- 6. 更新快照 ---
         self.prev_Phi = Phi
-        self.prev_W_bs = W_fixed if decision_success else np.zeros_like(W_fixed)
+        # 无论 decision_success 是否为 True，都用 W_fixed 更新 prev_W_bs
+        # 因为 BS 实际上仍在发射，只是可能没满足 SINR 约束
+        self.prev_W_bs = W_fixed
         self.prev_sinr_values = avg_sinr_values
         self.prev_obs_elevation = self.curr_obs_elevation
         self.prev_obs_azimuth = self.curr_obs_azimuth
+        self.prev_P_sat = P_sat_fixed
 
         # --- 7. RL step 计数器更新 ---
         self.current_step += 1
@@ -365,22 +379,35 @@ class ITSNEnv(gym.Env):
         """
         综合考虑系统总能耗和所有用户 (K+1) 的 SINR 满足情况 [cite: 83, 87, 168]
         使用线性尺度的 SINR gap 以提供更平滑的梯度
+
+        增加对P_sat过高的惩罚，避免RIS相位导致卫星信道相消干涉
         """
         # 1. 能效奖励：最小化系统总功耗 [cite: 168]
         total_p = P_BS + P_sat
-        reward_energy = -10 * np.log10(total_p + 1e-6)
+        reward_energy = -10 * np.log10(total_p)
 
         # 2. SINR 约束检查 (K 个 UE + 1 个 SU) - 线性尺度
         # 计算每个用户相对于阈值的违规量（线性尺度提供更平滑梯度）
-        sinr_gaps = np.maximum(0, self.sinr_threshold_linear - all_sinr_values)
-        normalized_gaps = sinr_gaps / (self.sinr_threshold_linear + 1e-12)
+        # 留0.2dB余量
+        soft_threshold = 10 ** ((self.sinr_threshold_db - 0.2) / 10.0)
+        sinr_gaps = np.maximum(0, soft_threshold - all_sinr_values)
+        normalized_gaps = sinr_gaps / soft_threshold
         penalty_sinr = -self.sinr_penalty_weight * np.sum(normalized_gaps)
 
-        # 3. 综合奖励
+        # 3. P_sat过高惩罚：避免RIS相位破坏卫星信道（导致相消干涉）
+        # 当P_sat超过阈值时，给予额外惩罚
+        P_sat_threshold = 5.0  # 正常P_sat应在5W以下
+        if P_sat > P_sat_threshold:
+            # 惩罚与超出量成正比，使用log避免梯度爆炸
+            penalty_psat = -10.0 * np.log10(P_sat / P_sat_threshold)
+        else:
+            penalty_psat = 0.0
+
+        # 4. 综合奖励
         # 如果所有约束满足 (success=True 且 gaps=0)，给予额外奖励
         bonus_all_satisfied = 5.0 if success and np.all(sinr_gaps <= 1e-6) else 0.0
 
-        return reward_energy + penalty_sinr + bonus_all_satisfied
+        return reward_energy + penalty_sinr + penalty_psat + bonus_all_satisfied
 
     def _calculate_reward_weighted_rate(self, P_BS, P_sat, all_sinr_values, success):
         """
@@ -496,13 +523,10 @@ class ITSNEnv(gym.Env):
 
         # Initialize prev_* variables for state construction (regardless of success)
         self.prev_Phi = Phi_init
-        if 'W_init' in locals() and W_init is not None:
-            self.prev_W_bs = W_init
-            self.prev_sinr_values = all_sinr_true  # All K+1 users (UE + SUE)
-        else:
-            self.prev_W_bs = np.zeros((self.scenario.N_t, self.scenario.K), dtype=complex)
-            self.prev_sinr_values = np.ones(self.scenario.K + 1) * self.sinr_threshold_linear
-
+        self.prev_W_bs = W_init
+        self.prev_P_sat = P_sat_init
+        self.prev_sinr_values = all_sinr_true  # All K+1 users (UE + SUE)
+        
 
     def calculate_all_sinrs(self, Phi, W, P_sat, channels):
         """
@@ -528,30 +552,30 @@ class ITSNEnv(gym.Env):
             # 预期信号功率 (使用 P_bs_scale 还原真实功率)
             h_eff_k = H_eff_k[k, :]
             w_k = W[:, k]
-            signal_power = self.scenario.P_bs_scale * (np.abs(np.vdot(h_eff_k, w_k))**2)
-            
+            signal_power = self.scenario.P_bs_scale * (np.abs(h_eff_k @ w_k)**2)
+
             # 内部干扰 (Intra-system interference from BS)
             intra_interf = 0
             for j in range(K):
                 if j != k:
-                    intra_interf += self.scenario.P_bs_scale * (np.abs(np.vdot(h_eff_k, W[:, j]))**2)
-            
+                    intra_interf += self.scenario.P_bs_scale * (np.abs(h_eff_k @ W[:, j])**2)
+
             # 卫星干扰 (Inter-system interference from LEO)
             h_sat_eff_k = H_sat_eff_k[k, :]
-            sat_interf = P_sat * (np.abs(np.vdot(h_sat_eff_k, W_sat[:, 0]))**2)
-            
+            sat_interf = P_sat * (np.abs(h_sat_eff_k @ W_sat[:, 0])**2)
+
             sinr_ue[k] = signal_power / (intra_interf + sat_interf + noise_pow)
 
         # 3. 计算 1 个卫星用户 (SU) 的 SINR
         # 预期卫星信号功率
         h_sat_eff_su = H_sat_eff_su[0, :]
-        sat_signal = P_sat * (np.abs(np.vdot(h_sat_eff_su, W_sat[:, 0]))**2)
-        
+        sat_signal = P_sat * (np.abs(h_sat_eff_su @ W_sat[:, 0])**2)
+
         # 基站产生的聚合干扰
         bs_to_sat_interf = 0
         for k in range(K):
             h_eff_su_k = H_eff_su[0, :]
-            bs_to_sat_interf += self.scenario.P_bs_scale * (np.abs(np.vdot(h_eff_su_k, W[:, k]))**2)
+            bs_to_sat_interf += self.scenario.P_bs_scale * (np.abs(h_eff_su_k @ W[:, k])**2)
             
         sinr_su = sat_signal / (bs_to_sat_interf + noise_pow)
 
@@ -724,12 +748,12 @@ class ITSNEnv(gym.Env):
             for k in range(K):
                 h_eff_k = H_eff_k[k, :]  # (N_t,)
                 w_k = self.prev_W_bs[:, k]  # (N_t,)
-                signal_strength_ue[k] = np.abs(np.vdot(h_eff_k, w_k)) ** 2
+                signal_strength_ue[k] = np.abs(h_eff_k @ w_k) ** 2
 
             # Signal strength for 1 SUE: |h_sat_eff_s^H @ w_sat|^2
             h_sat_eff_s = H_sat_eff_s[0, :]  # (N_sat,)
             w_sat = W_sat[:, 0]  # (N_sat,)
-            signal_strength_sue = np.abs(np.vdot(h_sat_eff_s, w_sat)) ** 2
+            signal_strength_sue = np.abs(h_sat_eff_s @ w_sat) ** 2
 
             signal_strength = np.append(signal_strength_ue, signal_strength_sue)
 
@@ -750,7 +774,7 @@ class ITSNEnv(gym.Env):
             for k in range(K):
                 # SAT interference to UE k
                 h_sat_eff_k = H_sat_eff_k[k, :]  # (N_sat,)
-                sat_interference = self.scenario.P_sat * (np.abs(np.vdot(h_sat_eff_k, w_sat)) ** 2)
+                sat_interference = self.scenario.P_sat * (np.abs(h_sat_eff_k @ w_sat) ** 2)
 
                 # Other BS user interference
                 bs_interference = 0.0
@@ -758,7 +782,7 @@ class ITSNEnv(gym.Env):
                     if j != k:
                         h_eff_k = H_eff_k[k, :]  # (N_t,)
                         w_j = self.prev_W_bs[:, j]  # (N_t,)
-                        bs_interference += self.scenario.P_bs_scale * (np.abs(np.vdot(h_eff_k, w_j)) ** 2)
+                        bs_interference += self.scenario.P_bs_scale * (np.abs(h_eff_k @ w_j) ** 2)
 
                 interference_ue[k] = sat_interference + bs_interference
 
@@ -770,7 +794,7 @@ class ITSNEnv(gym.Env):
             for k in range(K):
                 h_eff_j = H_eff_j[0, :]  # (N_t,) - assume single SAT user
                 w_k = self.prev_W_bs[:, k]  # (N_t,)
-                interference_sue += self.scenario.P_bs_scale * (np.abs(np.vdot(h_eff_j, w_k)) ** 2)
+                interference_sue += self.scenario.P_bs_scale * (np.abs(h_eff_j @ w_k) ** 2)
 
             interference = np.append(interference_ue, interference_sue)
 

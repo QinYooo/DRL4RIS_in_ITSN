@@ -141,7 +141,7 @@ def make_env(ephemeris_noise_std=0.5, use_ou_noise=True, ou_theta=0.15):
         ephemeris_noise_std=ephemeris_noise_std if not use_ou_noise else 0.0,
         sinr_threshold_db=10.0,
         sinr_penalty_weight=10.0,
-        phase_bits=2,  # 2-bit quantization (4 levels)
+        phase_bits=2,  # 已改为连续相移，此参数仅保留用于兼容性
         max_steps_per_episode=100,
     )
 

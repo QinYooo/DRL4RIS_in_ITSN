@@ -63,3 +63,7 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+.ai-plans/
+
+
