@@ -32,7 +32,7 @@ def test_state_dimensions():
     # Autoencoder environment (without checkpoint, using random AE)
     env_ae = ITSNEnvAE(
         ae_checkpoint_path=None,
-        latent_dim=32,
+        latent_dim=128,
         max_steps_per_episode=10,
         n_substeps=2
     )
@@ -73,7 +73,7 @@ def test_episode_rollout():
     print("\n[Autoencoder Features Environment]")
     env_ae = ITSNEnvAE(
         ae_checkpoint_path=None,
-        latent_dim=32,
+        latent_dim=128,
         max_steps_per_episode=n_steps,
         n_substeps=2
     )
@@ -104,7 +104,7 @@ def visualize_state_comparison():
     env_manual = ITSNEnv(max_steps_per_episode=20, n_substeps=2, rng_seed=42)
     env_ae = ITSNEnvAE(
         ae_checkpoint_path=None,
-        latent_dim=32,
+        latent_dim=128,
         max_steps_per_episode=20,
         n_substeps=2,
         rng_seed=42

@@ -1,6 +1,8 @@
 """
 Channel Autoencoder for State Space Compression
 Compresses high-dimensional channel matrices into low-dimensional latent representations
+
+Uses low-rank factorized linear layers to reduce parameter count.
 """
 
 import torch
@@ -8,67 +10,60 @@ import torch.nn as nn
 import numpy as np
 
 
+class FactorizedLinear(nn.Module):
+    """Low-rank factorized linear: in -> rank -> out"""
+
+    def __init__(self, in_features, out_features, rank=128, bias=True):
+        super().__init__()
+        self.proj1 = nn.Linear(in_features, rank, bias=False)
+        self.proj2 = nn.Linear(rank, out_features, bias=bias)
+
+    def forward(self, x):
+        return self.proj2(self.proj1(x))
+
+
 class ChannelAutoencoder(nn.Module):
     """
-    Autoencoder for compressing ITSN channel matrices
-
-    Input: Flattened channel matrices (real and imaginary parts)
-    Output: Latent representation (compressed features)
+    Compact AE for high-dimensional channel vectors.
+    Uses FactorizedLinear for large layers to reduce parameters.
     """
 
-    def __init__(self, input_dim, latent_dim=32, hidden_dims=[128, 64]):
-        """
-        Args:
-            input_dim: Total dimension of flattened channel vector
-            latent_dim: Dimension of compressed latent space
-            hidden_dims: List of hidden layer dimensions
-        """
+    def __init__(self, input_dim, latent_dim=64, hidden_dims=(512, 256), rank=128):
         super().__init__()
-
         self.input_dim = input_dim
         self.latent_dim = latent_dim
 
-        # Encoder
-        encoder_layers = []
-        prev_dim = input_dim
-        for hidden_dim in hidden_dims:
-            encoder_layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1)
-            ])
-            prev_dim = hidden_dim
-        encoder_layers.append(nn.Linear(prev_dim, latent_dim))
-        self.encoder = nn.Sequential(*encoder_layers)
+        # Encoder: input_dim -> hidden_dims -> latent_dim
+        prev = input_dim
+        enc = []
+        for h in hidden_dims:
+            enc += [FactorizedLinear(prev, h, rank=rank), nn.ReLU()]
+            prev = h
+        enc += [nn.Linear(prev, latent_dim)]
+        self.encoder = nn.Sequential(*enc)
 
-        # Decoder
-        decoder_layers = []
-        prev_dim = latent_dim
-        for hidden_dim in reversed(hidden_dims):
-            decoder_layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1)
-            ])
-            prev_dim = hidden_dim
-        decoder_layers.append(nn.Linear(prev_dim, input_dim))
-        self.decoder = nn.Sequential(*decoder_layers)
+        # Decoder: latent_dim -> hidden_dims (reversed) -> input_dim
+        prev = latent_dim
+        dec = []
+        for h in reversed(hidden_dims):
+            dec += [nn.Linear(prev, h), nn.ReLU()]
+            prev = h
+        dec += [FactorizedLinear(prev, input_dim, rank=rank)]
+        self.decoder = nn.Sequential(*dec)
 
     def encode(self, x):
-        """Encode channel vector to latent representation"""
         return self.encoder(x)
 
     def decode(self, z):
-        """Decode latent representation back to channel vector"""
         return self.decoder(z)
 
     def forward(self, x):
-        """Full autoencoder forward pass"""
         z = self.encode(x)
         x_recon = self.decode(z)
         return x_recon, z
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 def preprocess_channels(channels, use_inferred_G_SAT=False, inferred_G_SAT=None):

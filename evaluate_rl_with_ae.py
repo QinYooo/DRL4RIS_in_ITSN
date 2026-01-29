@@ -1,5 +1,5 @@
 """
-Evaluate trained RL agent with AE-compressed state
+Evaluate trained RL agent (supports both AE-compressed and full geometry state)
 Load model from logs directory and run detailed trajectory evaluation
 """
 
@@ -16,21 +16,28 @@ from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).parent))
 
+from envs.itsn_env import ITSNEnv
 from envs.itsn_env_ae import ITSNEnvAE
 from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+import pickle
 
 
 def evaluate_on_trajectory(
     model,
     env,
+    is_recurrent=False,
     verbose=True
 ):
     """
     在单条轨道上评估模型，记录每个step的详细信息
+    正确处理 RecurrentPPO 的 LSTM state 和 VecNormalize
 
     Args:
-        model: 训练好的PPO模型
-        env: 评估环境
+        model: 训练好的PPO或RecurrentPPO模型
+        env: 已被VecNormalize包裹的评估环境
+        is_recurrent: 是否为RecurrentPPO模型
         verbose: 是否打印详细信息
 
     Returns:
@@ -53,8 +60,18 @@ def evaluate_on_trajectory(
         'rewards': [],
     }
 
+    # 初始化 LSTM state (每条轨迹开始时重置)
+    lstm_state = None
+    episode_start = True  # 标记episode开始，用于LSTM
+
     # 运行一个完整episode
-    obs, info = env.reset()
+    # VecEnv.reset() 返回 obs, Gym Env.reset() 返回 (obs, info)
+    reset_result = env.reset()
+    if isinstance(reset_result, tuple) and len(reset_result) == 2:
+        obs, info = reset_result
+    else:
+        obs = reset_result
+        info = {}
     done = False
     step = 0
 
@@ -63,12 +80,34 @@ def evaluate_on_trajectory(
         print(f"{'-'*60}")
 
     while not done:
-        # 获取动作
-        action, _ = model.predict(obs, deterministic=True)
+        # ====== 关键修改1: 正确处理 RecurrentPPO LSTM state ======
+        if is_recurrent:
+            # RecurrentPPO predict: 返回 (action, lstm_state)
+            action, lstm_state = model.predict(
+                obs,
+                state=lstm_state,
+                episode_start=np.array([episode_start]),
+                deterministic=True
+            )
+            # 第一步之后，episode_start 设为 False
+            episode_start = False
+        else:
+            # 普通 PPO predict
+            action, _ = model.predict(obs, deterministic=True)
 
         # 执行动作
-        obs, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
+        # VecEnv.step() 返回 (obs, reward, done, infos) 4个值, infos 是列表
+        # Gym Env.step() 返回 (obs, reward, terminated, truncated, info) 5个值, info 是字典
+        step_result = env.step(action)
+        if len(step_result) == 5:
+            obs, reward, terminated, truncated, info = step_result
+            done = terminated or truncated
+        elif len(step_result) == 4:
+            obs, reward, done, infos = step_result
+            # VecEnv 的 infos 是列表，取第一个环境的 info
+            info = infos[0] if isinstance(infos, list) else infos
+        else:
+            raise ValueError(f"Unexpected step result: {step_result}")
 
         # 记录数据
         P_BS = info.get('P_BS', 0)
@@ -132,18 +171,23 @@ def evaluate_on_trajectory(
     return results
 
 
-def evaluate_multiple_trajectories(model, ae_checkpoint_path, n_episodes=10,
-                                    seed=None, device='cuda', verbose=False, **env_kwargs):
+def evaluate_multiple_trajectories(model, use_ae=True, ae_checkpoint_path=None, n_episodes=10,
+                                    seed=None, device='cuda', verbose=False, is_recurrent=False,
+                                    vecnormalize_path=None, **env_kwargs):
     """
-    在多条随机轨道上评估模型
+    在多条随机轨道上评估模型（支持 AE 压缩和完整几何状态两种环境）
+    正确加载并使用训练时的 VecNormalize 统计量
 
     Args:
         model: 训练好的模型
-        ae_checkpoint_path: AE checkpoint路径
+        use_ae: 是否使用 Autoencoder 压缩状态
+        ae_checkpoint_path: AE checkpoint路径（如果 use_ae=True 则必需）
         n_episodes: 评估的轨道数量
         seed: 基础随机种子
         device: 设备
         verbose: 是否打印每条轨道的详细信息
+        is_recurrent: 是否为RecurrentPPO模型（用于正确处理LSTM state）
+        vecnormalize_path: VecNormalize .pkl文件路径（用于加载训练统计量）
         **env_kwargs: 环境参数
 
     Returns:
@@ -155,19 +199,39 @@ def evaluate_multiple_trajectories(model, ae_checkpoint_path, n_episodes=10,
         seed = np.random.randint(0, 100000)
 
     for i in tqdm(range(n_episodes), desc="Evaluating trajectories"):
-        env = ITSNEnvAE(
-            ae_checkpoint_path=ae_checkpoint_path,
-            rng_seed=seed + i,
-            device=device,
-            **env_kwargs
-        )
+        # ====== 关键修改2: 加载并使用训练时的 VecNormalize 统计量 ======
+        # 首先创建环境函数，避免lambda捕获问题
+        def make_env():
+            if use_ae:
+                return ITSNEnvAE(
+                    ae_checkpoint_path=ae_checkpoint_path,
+                    rng_seed=seed + i,
+                    device=device,
+                    **env_kwargs
+                )
+            else:
+                return ITSNEnv(
+                    rng_seed=seed + i,
+                    **env_kwargs
+                )
+
+        if vecnormalize_path is not None:
+            # 用 DummyVecEnv 包裹，然后用 VecNormalize.load 加载训练统计量
+            env = DummyVecEnv([make_env])
+            env = VecNormalize.load(vecnormalize_path, env)
+            # 评估模式设置
+            env.training = False
+            env.norm_reward = False  # 评估时不归一化reward，输出原始reward
+        else:
+            # 没有归一化文件，直接使用原始环境
+            env = make_env()
 
         if verbose:
             print(f"\n{'='*60}")
             print(f"Trajectory {i+1}/{n_episodes} (seed={seed + i})")
             print(f"{'='*60}")
 
-        results = evaluate_on_trajectory(model, env, verbose=verbose)
+        results = evaluate_on_trajectory(model, env, is_recurrent=is_recurrent, verbose=verbose)
         results['seed'] = seed + i
         all_results.append(results)
 
@@ -359,30 +423,65 @@ def plot_aggregated_results(all_results, save_path=None):
 
 
 def find_latest_model(log_dir='logs'):
-    """查找最新的训练模型"""
+    """查找最新的训练模型和对应的VecNormalize文件
+
+    Returns:
+        model_path: 模型路径或None
+        run_dir: 运行目录或None
+        vecnormalize_path: VecNormalize文件路径或None
+    """
     log_path = Path(log_dir)
     if not log_path.exists():
-        return None, None
+        return None, None, None
 
-    # 查找所有PPO_AE开头的目录
+    # 查找所有训练目录 (PPO_AE_* 或 RecurrentPPO_*)
     run_dirs = sorted(log_path.glob('PPO_AE_*'), key=lambda x: x.stat().st_mtime, reverse=True)
+    run_dirs.extend(sorted(log_path.glob('RecurrentPPO_*'), key=lambda x: x.stat().st_mtime, reverse=True))
 
     for run_dir in run_dirs:
         # 优先查找best_model
         best_model = run_dir / 'best_model' / 'best_model.zip'
         if best_model.exists():
-            return best_model, run_dir
+            # 查找对应的vecnormalize.pkl (搜索 run_dir/best_model/ 和 run_dir/)
+            vecnormalize_path = None
+            for pkl_file in (run_dir / 'best_model').glob('*.pkl'):
+                if 'vec' in pkl_file.name.lower() and 'normalize' in pkl_file.name.lower():
+                    vecnormalize_path = pkl_file
+                    break
+            if vecnormalize_path is None:
+                for pkl_file in (run_dir / 'final_model').glob('*.pkl'):
+                    if 'vec' in pkl_file.name.lower() and 'normalize' in pkl_file.name.lower():
+                        vecnormalize_path = pkl_file
+                        break
+            return best_model, run_dir, vecnormalize_path
 
         # 其次查找final_model
         final_model = run_dir / 'final_model.zip'
         if final_model.exists():
-            return final_model, run_dir
+            # 查找对应的vecnormalize.pkl (搜索 run_dir/final_model/ 和 run_dir/)
+            vecnormalize_path = None
+            final_model_dir = run_dir / 'final_model'
+            if final_model_dir.is_dir():
+                for pkl_file in final_model_dir.glob('*.pkl'):
+                    if 'vec' in pkl_file.name.lower() and 'normalize' in pkl_file.name.lower():
+                        vecnormalize_path = pkl_file
+                        break
+            if vecnormalize_path is None:
+                for pkl_file in run_dir.glob('*.pkl'):
+                    if 'vec' in pkl_file.name.lower() and 'normalize' in pkl_file.name.lower():
+                        vecnormalize_path = pkl_file
+                        break
+            return final_model, run_dir, vecnormalize_path
 
-    return None, None
+    return None, None, None
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate trained RL agent with AE')
+    parser = argparse.ArgumentParser(description='Evaluate trained RL agent (supports AE-compressed and full geometry state)')
+
+    # 环境类型
+    parser.add_argument('--use-ae', action='store_true',
+                       help='Use autoencoder-compressed state (default: False, use full geometry state)')
 
     # 模型路径
     parser.add_argument('--model-path', type=str, default=None,
@@ -391,7 +490,7 @@ def main():
                        help='Log directory to search for models')
     parser.add_argument('--ae-checkpoint', type=str,
                        default='checkpoints/channel_ae/channel_ae_best.pth',
-                       help='Path to AE checkpoint')
+                       help='Path to AE checkpoint (required if --use-ae)')
 
     # 评估参数
     parser.add_argument('--n-episodes', type=int, default=10,
@@ -408,67 +507,99 @@ def main():
     # 环境参数
     parser.add_argument('--max-steps', type=int, default=64,
                        help='Max steps per episode')
-    parser.add_argument('--n-substeps', type=int, default=10,
+    parser.add_argument('--n-substeps', type=int, default=1,
                        help='Physics substeps per RL step')
-    parser.add_argument('--latent-dim', type=int, default=32,
-                       help='AE latent dimension')
+    parser.add_argument('--latent-dim', type=int, default=128,
+                       help='AE latent dimension (will be auto-detected from checkpoint if available)')
 
     args = parser.parse_args()
 
-    # 查找模型
+    # 查找模型和VecNormalize
     if args.model_path is None:
-        model_path, run_dir = find_latest_model(args.log_dir)
+        model_path, run_dir, vecnormalize_path = find_latest_model(args.log_dir)
         if model_path is None:
             print(f"Error: No model found in {args.log_dir}")
             print("Please specify --model-path or train a model first")
             return 1
         print(f"Using latest model: {model_path}")
+        if vecnormalize_path is not None:
+            print(f"Using VecNormalize from: {vecnormalize_path}")
     else:
         model_path = Path(args.model_path)
         run_dir = model_path.parent.parent if 'best_model' in str(model_path) else model_path.parent
+        # 尝试在运行目录中查找vecnormalize.pkl (搜索 run_dir 和子目录)
+        vecnormalize_path = None
+        for search_dir in [run_dir, model_path.parent]:
+            for pkl_file in search_dir.glob('*.pkl'):
+                if 'vec' in pkl_file.name.lower() and 'normalize' in pkl_file.name.lower():
+                    vecnormalize_path = pkl_file
+                    print(f"Found VecNormalize: {vecnormalize_path}")
+                    break
+            if vecnormalize_path is not None:
+                break
 
     if not model_path.exists():
         print(f"Error: Model not found at {model_path}")
         return 1
 
-    ae_checkpoint = Path(args.ae_checkpoint)
-    if not ae_checkpoint.exists():
-        print(f"Error: AE checkpoint not found at {ae_checkpoint}")
-        return 1
+    # 检查 AE checkpoint（如果使用 AE）
+    ae_checkpoint_path = None
+    if args.use_ae:
+        ae_checkpoint = Path(args.ae_checkpoint)
+        if not ae_checkpoint.exists():
+            print(f"Error: AE checkpoint not found at {ae_checkpoint}")
+            return 1
+        ae_checkpoint_path = str(ae_checkpoint)
 
     # 创建输出目录
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print("Evaluating RL Agent with AE-Compressed State")
+    if args.use_ae:
+        print("Evaluating RL Agent with AE-Compressed State")
+    else:
+        print("Evaluating RL Agent with Full Geometry State")
     print("=" * 60)
     print(f"Model: {model_path}")
-    print(f"AE checkpoint: {ae_checkpoint}")
+    if args.use_ae:
+        print(f"AE checkpoint: {ae_checkpoint_path}")
     print(f"Episodes: {args.n_episodes}")
     print(f"Device: {args.device}")
     print("=" * 60)
 
-    # 加载模型
+    # 加载模型（根据类型选择 PPO 或 RecurrentPPO）
     print("\nLoading model...")
-    model = PPO.load(model_path)
+    # 检测模型类型：如果目录名包含 RecurrentPPO 则使用 RecurrentPPO
+    is_recurrent = 'RecurrentPPO' in str(run_dir)
+    if is_recurrent:
+        model = RecurrentPPO.load(model_path)
+        print("Using RecurrentPPO (LSTM policy)")
+    else:
+        model = PPO.load(model_path)
+        print("Using PPO")
 
     # 环境参数
     env_kwargs = {
         'max_steps_per_episode': args.max_steps,
         'n_substeps': args.n_substeps,
-        'latent_dim': args.latent_dim,
     }
+    # Only add latent_dim if using AE
+    if args.use_ae:
+        env_kwargs['latent_dim'] = args.latent_dim
 
     # 评估多条轨道
     print(f"\nEvaluating on {args.n_episodes} trajectories...")
     all_results = evaluate_multiple_trajectories(
         model=model,
-        ae_checkpoint_path=str(ae_checkpoint),
+        use_ae=args.use_ae,
+        ae_checkpoint_path=ae_checkpoint_path,
         n_episodes=args.n_episodes,
         seed=args.seed,
         device=args.device,
         verbose=args.verbose,
+        is_recurrent=is_recurrent,  # ====== 关键修改3: 传递 recurrent 标志 ======
+        vecnormalize_path=vecnormalize_path,  # ====== 关键修改4: 传递 VecNormalize 路径 ======
         **env_kwargs
     )
 

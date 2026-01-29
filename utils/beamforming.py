@@ -168,7 +168,7 @@ def compute_mrt_beamforming(H_eq, total_power):
 
 
 def compute_zf_waterfilling_baseline(H_eff_k, H_eff_j, H_sat_eff_k, W_sat, P_sat, P_bs_scale,
-                                     sinr_threshold_linear, noise_power, max_power=10.0):
+                                     sinr_threshold_linear, noise_power, max_power=100):
     """
     Baseline-style Zero-Forcing beamforming with iterative power allocation.
 
@@ -256,7 +256,7 @@ def compute_zf_waterfilling_baseline(H_eff_k, H_eff_j, H_sat_eff_k, W_sat, P_sat
             p[k] = max(sinr_threshold_linear * (interference + noise_power) / (signal_power + 1e-20), 0)
 
         # Step 3: Check power budget
-        total_power = np.linalg.norm(np.sqrt(p).reshape(-1, 1) * w.T, 'fro') ** 2
+        total_power = P_bs_scale * np.linalg.norm(np.sqrt(p).reshape(-1, 1) * w.T, 'fro') ** 2
 
         if total_power > max_power:
             # Use water-filling

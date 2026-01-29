@@ -60,7 +60,7 @@ def train_rl_agent(
     clip_range=0.1,
     ent_coef=0.01,
     vf_coef=0.5,
-    max_grad_norm=0.5,
+    max_grad_norm=3.0,
     seed=42,
     device='cuda',
     log_dir='logs',
@@ -123,14 +123,18 @@ def train_rl_agent(
     else:
         env = DummyVecEnv([make_env(ae_checkpoint_path, 0, seed, device, **env_kwargs)])
 
-    # Normalize rewards for better learning
-    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+    # Disable reward normalization to preserve gradient signal
+    env = VecNormalize(env, norm_obs=False, norm_reward=False)
 
     # Create evaluation environment
     eval_env = DummyVecEnv([make_env(ae_checkpoint_path, 999, seed, device, **env_kwargs)])
     eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=False, training=False)
 
-    # Create PPO agent
+    # Create PPO agent with larger network for better value function learning
+    policy_kwargs = dict(
+        net_arch=dict(pi=[256, 256], vf=[256, 256])  # Larger networks for both policy and value
+    )
+
     model = PPO(
         policy='MlpPolicy',
         env=env,
@@ -142,12 +146,13 @@ def train_rl_agent(
         gae_lambda=gae_lambda,
         clip_range=clip_range,
         ent_coef=ent_coef,
-        vf_coef=vf_coef,
+        vf_coef=1.0,  # Increased from 0.5 to improve value function learning
         max_grad_norm=max_grad_norm,
         verbose=1,
         tensorboard_log=str(log_path / 'tensorboard'),
         device=device,
-        seed=seed
+        seed=seed,
+        policy_kwargs=policy_kwargs
     )
 
     print(f"\nPPO Agent created:")
@@ -560,7 +565,7 @@ def main():
                        help='Number of parallel environments (recommended: 16-32 for episode_length=40)')
     parser.add_argument('--n-steps', type=int, default=64,
                        help='Steps per environment per update (recommended: 64-128 for episode_length=40)')
-    parser.add_argument('--learning-rate', type=float, default=1e-4,
+    parser.add_argument('--learning-rate', type=float, default=3e-4,
                        help='Learning rate')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
@@ -569,14 +574,14 @@ def main():
                        help='Device to use')
 
     # Environment parameters
-    parser.add_argument('--max-steps', type=int, default=64,
+    parser.add_argument('--max-steps', type=int, default=128,
                        help='Max steps per episode (should match n_steps for 1 episode per rollout)')
     parser.add_argument('--n-substeps', type=int, default=10,
                        help='Physics substeps per RL step (use 1 to avoid channel mismatch)')
     parser.add_argument('--phase-bits', type=int, default=4,
                        help='RIS phase quantization bits')
-    parser.add_argument('--latent-dim', type=int, default=32,
-                       help='AE latent dimension')
+    parser.add_argument('--latent-dim', type=int, default=128,
+                       help='AE latent dimension (will be auto-detected from checkpoint if available)')
 
     # Logging
     parser.add_argument('--log-dir', type=str, default='logs',

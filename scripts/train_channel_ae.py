@@ -305,7 +305,7 @@ def visualize_reconstruction(model, channel_samples, normalization_stats, n_samp
 def main():
     # Configuration
     N_SAMPLES = 20000  # Increased for better coverage
-    LATENT_DIM = 32
+    LATENT_DIM = 128   # Increased from 32 for better reconstruction
     EPOCHS = 200  # More epochs with early stopping
     BATCH_SIZE = 128
     LR = 1e-3
