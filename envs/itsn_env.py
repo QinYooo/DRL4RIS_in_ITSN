@@ -384,8 +384,8 @@ class ITSNEnv(gym.Env):
         info = {
             "success": avg_success,
             "success_rate": success_count / max(actual_substeps, 1),
-            "P_BS": P_BS_fixed,
-            "P_sat": P_sat_fixed,
+            "P_BS": P_BS_fixed*np.linalg.norm(self.prev_W_bs)**2,
+            "P_sat": P_sat_fixed*np.linalg.norm(self.current_channels['W_sat'])**2,
             "actual_substeps": actual_substeps,
             # Ephemeris uncertainty tracking
             "true_elevation": self.true_elevation,

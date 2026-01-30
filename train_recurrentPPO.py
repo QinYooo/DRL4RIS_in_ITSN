@@ -7,6 +7,10 @@ Supports two environment types:
     - ITSNEnvAE: Autoencoder-compressed state (6 + latent_dim + (K+1) dims)
 """
 
+import os
+# Fix OpenMP library conflict on Windows
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 import numpy as np
 import torch
 from pathlib import Path
@@ -20,6 +24,8 @@ sys.path.append(str(Path(__file__).parent))
 from envs.itsn_env import ITSNEnv
 from envs.itsn_env_ae import ITSNEnvAE
 from sb3_contrib import RecurrentPPO  # Changed from PPO
+from baseline.baseline_optimizer import BaselineZFSDROptimizer
+from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
@@ -80,6 +86,8 @@ def train_rl_agent(
     checkpoint_freq=50000,
     eval_freq=10000,
     eval_episodes=10,
+    run_baseline_optimizer=False,
+    skip_zero_baseline=False,
     **env_kwargs
 ):
     """
@@ -106,6 +114,8 @@ def train_rl_agent(
         checkpoint_freq: Save checkpoint every N steps
         eval_freq: Evaluate every N steps
         eval_episodes: Number of evaluation episodes
+        run_baseline_optimizer: Whether to run baseline optimizer (ZF+SDR) evaluation
+        skip_zero_baseline: Whether to skip zero-action baseline evaluation
         **env_kwargs: Additional environment arguments
     """
 
@@ -218,17 +228,47 @@ def train_rl_agent(
     )
 
     # ========== Baseline 评估 (零动作) ==========
-    print("\n" + "=" * 60)
-    print("Baseline evaluation (zero action)...")
-    print("=" * 60)
-    baseline_results = evaluate_baseline(
-        use_ae=use_ae,
-        ae_checkpoint_path=ae_checkpoint_path,
-        seed=seed,
-        device=device,
-        save_path=log_path / 'baseline_eval.json',
-        **env_kwargs
-    )
+    if not skip_zero_baseline:
+        print("\n" + "=" * 60)
+        print("Baseline evaluation (zero action)...")
+        print("=" * 60)
+        baseline_results = evaluate_baseline(
+            use_ae=use_ae,
+            ae_checkpoint_path=ae_checkpoint_path,
+            seed=seed,
+            device=device,
+            save_path=log_path / 'baseline_zero_action_eval.json',
+            **env_kwargs
+        )
+    else:
+        print("\n[Info] Skipping zero-action baseline evaluation")
+
+    # ========== Baseline Optimizer 评估 (ZF+SDR) ==========
+    if run_baseline_optimizer:
+        print("\n" + "=" * 60)
+        print("Baseline Optimizer evaluation (ZF+SDR)...")
+        print("=" * 60)
+        baseline_optimizer_results = evaluate_baseline_optimizer(
+            use_ae=use_ae,
+            ae_checkpoint_path=ae_checkpoint_path,
+            seed=seed,
+            device=device,
+            save_path=log_path / 'baseline_optimizer_eval.json',
+            **env_kwargs
+        )
+    else:
+        print("\n[Info] Skipping baseline optimizer evaluation (use --run-baseline-optimizer to enable)")
+
+    # ========== Baseline 对比摘要 ==========
+    if not skip_zero_baseline and run_baseline_optimizer:
+        print("\n" + "=" * 60)
+        print("BASELINE COMPARISON (Pre-training)")
+        print("=" * 60)
+        print(f"{'Method':<25} | {'Avg P_total':>12} | {'SINR_min':>10} | {'Success':>10}")
+        print(f"-" * 60)
+        print(f"{'Zero-Action':<25} | {baseline_results['summary']['avg_P_total']:>12.4f} | {baseline_results['summary']['avg_SINR_min_dB']:>10.2f} | {baseline_results['summary']['success_rate']*100:>9.1f}%")
+        print(f"{'Baseline Optimizer':<25} | {baseline_optimizer_results['summary']['avg_P_total']:>12.4f} | {baseline_optimizer_results['summary']['avg_SINR_min_dB']:>10.2f} | {baseline_optimizer_results['summary']['success_rate']*100:>9.1f}%")
+        print(f"=" * 60 + "\n")
 
     # Train
     print("\n" + "=" * 60)
@@ -267,7 +307,35 @@ def train_rl_agent(
     env.close()
     eval_env.close()
 
-    print("\n" + "=" * 60)
+    # ========== 最终对比摘要 (DRL vs Baselines) ==========
+    print("\n" + "=" * 70)
+    print("FINAL COMPARISON SUMMARY (DRL Model vs Baselines)")
+    print("=" * 70)
+    print(f"{'Method':<25} | {'Avg P_total':>12} | {'SINR_min':>10} | {'Success':>10}")
+    print(f"-" * 70)
+
+    # Load baseline results if they exist
+    baseline_zero_path = log_path / 'baseline_zero_action_eval.json'
+    baseline_opt_path = log_path / 'baseline_optimizer_eval.json'
+    final_eval_path = log_path / 'final_trajectory_eval.json'
+
+    if baseline_zero_path.exists():
+        with open(baseline_zero_path, 'r') as f:
+            baseline_zero = json.load(f)
+        print(f"{'Zero-Action Baseline':<25} | {baseline_zero['summary']['avg_P_total']:>12.4f} | {baseline_zero['summary']['avg_SINR_min_dB']:>10.2f} | {baseline_zero['summary']['success_rate']*100:>9.1f}%")
+
+    if baseline_opt_path.exists():
+        with open(baseline_opt_path, 'r') as f:
+            baseline_opt = json.load(f)
+        print(f"{'Baseline Optimizer':<25} | {baseline_opt['summary']['avg_P_total']:>12.4f} | {baseline_opt['summary']['avg_SINR_min_dB']:>10.2f} | {baseline_opt['summary']['success_rate']*100:>9.1f}%")
+
+    if final_eval_path.exists():
+        with open(final_eval_path, 'r') as f:
+            final_eval = json.load(f)
+        print(f"{'DRL Model (Final)':<25} | {final_eval['summary']['avg_P_total']:>12.4f} | {final_eval['summary']['avg_SINR_min_dB']:>10.2f} | {final_eval['summary']['success_rate']*100:>9.1f}%")
+
+    print(f"=" * 70 + "\n")
+
     print("Training complete!")
     print("=" * 60)
     print(f"Results saved to: {log_path}")
@@ -302,7 +370,7 @@ def evaluate_on_trajectory(
     Returns:
         dict: 包含每个step的P_BS, P_sat, SINR_UE, SINR_SUE
     """
-    # 创建评估环境
+    # 创建评估环境 (禁用 ephemeris noise 以便公平比较)
     if seed is None:
         seed = np.random.randint(0, 100000)
 
@@ -311,11 +379,15 @@ def evaluate_on_trajectory(
             ae_checkpoint_path=ae_checkpoint_path,
             rng_seed=seed,
             device=device,
+            enable_ephemeris_noise=False,
+            ephemeris_noise_std=0.0,
             **env_kwargs
         )
     else:
         raw_env = ITSNEnv(
             rng_seed=seed,
+            enable_ephemeris_noise=False,
+            ephemeris_noise_std=0.0,
             **env_kwargs
         )
 
@@ -354,32 +426,23 @@ def evaluate_on_trajectory(
     while not done:
         # 关键步骤：使用训练环境的归一化器对观测值进行归一化
         # 这样可以确保评估时的观测值分布与训练时一致
-        if training_env is not None:
-            # 使用训练环境的归一化器
-            obs_normalized = training_env.normalize_obs(obs)
-        else:
-            # 没有训练环境，使用原始观测值
-            obs_normalized = obs
+        obs_normalized = training_env.normalize_obs(obs) if training_env is not None else obs
 
         # 获取动作（使用LSTM states）
         # 显式确保 obs 是二维的 (1, obs_dim)，以匹配 RecurrentPPO 的预期
-        obs_2d = obs_normalized[np.newaxis, :] if obs_normalized.ndim == 1 else obs_normalized
         action, lstm_states = model.predict(
-            obs_2d,
+            obs_normalized[np.newaxis, :],
             state=lstm_states,
             episode_start=episode_starts,
             deterministic=True
         )
 
-        # RecurrentPPO 返回的 action 是 2D 数组 (1, action_dim)，需要展平为 1D 数组
-        action = action.flatten()
+        episode_starts = np.zeros((1,), dtype=bool)
 
         # 执行动作
         obs, reward, terminated, truncated, info = raw_env.step(action)
         done = terminated or truncated
 
-        # 更新 episode_starts: episode 开始后设为 False，直到 episode 结束
-        episode_starts = np.zeros((1,), dtype=bool)
 
         # 记录数据
         P_BS = info.get('P_BS', 0)
@@ -474,11 +537,15 @@ def evaluate_baseline(
             ae_checkpoint_path=ae_checkpoint_path,
             rng_seed=seed,
             device=device,
+            enable_ephemeris_noise=False,
+            ephemeris_noise_std=0.0,
             **env_kwargs
         )
     else:
         env = ITSNEnv(
             rng_seed=seed,
+            enable_ephemeris_noise=False,
+            ephemeris_noise_std=0.0,
             **env_kwargs
         )
 
@@ -499,6 +566,7 @@ def evaluate_baseline(
         'true_azimuth': [],
     }
 
+    env.enable_ephemeris_noise = False  # 确保在 reset 前设置
     obs, info = env.reset()
     done = False
     step = 0
@@ -580,6 +648,190 @@ def evaluate_baseline(
         with open(save_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"Baseline results saved to {save_path}")
+
+    return results
+
+
+def evaluate_baseline_optimizer(
+    use_ae=False,
+    ae_checkpoint_path=None,
+    seed=42,
+    device='cuda',
+    save_path=None,
+    **env_kwargs
+):
+    """
+    Baseline Optimizer 评估：使用 ZF+SDR 方法 (baseline/baseline_optimizer.py)
+
+    Args:
+        use_ae: 是否使用 Autoencoder 压缩状态 (与baseline无关，保持接口一致)
+        ae_checkpoint_path: AE checkpoint路径
+        seed: 随机种子
+        device: 设备
+        save_path: 保存结果的路径
+        **env_kwargs: 环境参数
+
+    Returns:
+        dict: 包含每个step的详细信息
+    """
+    # 创建评估环境 (禁用 ephemeris noise 以便与 baseline 公平比较)
+    env = ITSNEnv(
+        rng_seed=seed,
+        enable_ephemeris_noise=False,  # 禁用噪声，使用真实卫星位置
+        ephemeris_noise_std=0.0,
+        **env_kwargs
+    )
+
+    # 初始化 baseline optimizer
+    sinr_threshold_db = env.sinr_threshold_db
+    sinr_threshold_linear = 10 ** (sinr_threshold_db / 10.0)
+    gamma_k = np.full(env.scenario.K, sinr_threshold_linear)
+    gamma_j = sinr_threshold_linear
+
+    baseline = BaselineZFSDROptimizer(
+        K=env.scenario.K,
+        J=env.scenario.J,
+        N_t=env.scenario.N_t,
+        N_s=env.scenario.N_s,
+        N=env.scenario.N_ris,
+        P_max=env.scenario.P_bs_max,
+        sigma2=env.scenario.P_noise,
+        gamma_k=gamma_k,
+        gamma_j=gamma_j,
+        ris_amplitude_gain=env.scenario.ris_amplitude_gain,
+        N_iter=10,  # 减少迭代次数以加快评估
+        verbose=False
+    )
+
+    # 记录数据
+    results = {
+        'seed': seed,
+        'type': 'baseline_optimizer_zf_sdr',
+        'steps': [],
+        'P_BS': [],
+        'P_sat': [],
+        'P_total': [],
+        'SINR_UE': [],
+        'SINR_SUE': [],
+        'SINR_min_dB': [],
+        'success': [],
+        'true_elevation': [],
+        'true_azimuth': [],
+        'opt_time': [],
+    }
+
+    env.enable_ephemeris_noise = False  # 确保在 reset 前设置
+    obs, info = env.reset()
+    done = False
+    step = 0
+
+    print(f"\n{'='*70}")
+    print(f"Baseline Optimizer Evaluation (ZF+SDR, seed={seed})")
+    print(f"{'='*70}")
+    print(f"{'Step':>4} | {'P_BS':>8} | {'P_sat':>8} | {'P_total':>8} | {'SINR_min':>10} | {'Time':>8} | {'Success':>7}")
+    print(f"{'-'*75}")
+
+    import time
+    total_opt_time = 0
+
+    while not done:
+        t_start = time.time()
+
+        # 获取当前信道
+        channels = env.current_channels
+
+        # 运行 baseline 优化
+        try:
+            w_opt, phi_opt, opt_info = baseline.optimize(
+                h_k=channels['h_k'],
+                h_j=channels['h_j'],
+                h_s_k=channels['h_s_k'],
+                h_s_j=channels['h_s_j'],
+                h_k_r=channels['h_k_r'],
+                h_j_r=channels['h_j_r'],
+                G_BS=channels['G_BS'],
+                G_S=env.true_G_SAT,  # 使用真实 G_SAT (无 ephemeris 不确定性)
+                W_sat=channels['W_sat']
+            )
+
+            # 计算实际性能
+            all_sinr = env.calculate_all_sinrs(phi_opt, w_opt, baseline.P_s, channels)
+
+            P_BS = opt_info['final_P_bs']
+            P_sat = opt_info['final_P_sat']
+            P_total = P_BS + P_sat
+
+            # 检查是否满足约束
+            soft_threshold = 10 ** ((env.sinr_threshold_db - 0.5) / 10.0)
+            success = np.all(all_sinr >= soft_threshold)
+
+        except Exception as e:
+            print(f"  [Warning] Optimization failed at step {step}: {e}")
+            P_BS, P_sat = 10.0, 10.0
+            P_total = 20.0
+            all_sinr = np.zeros(env.scenario.K + 1)
+            success = False
+
+        opt_time = time.time() - t_start
+        total_opt_time += opt_time
+
+        # 转换为 dB
+        sinr_min_db = 10 * np.log10(np.min(all_sinr) + 1e-12)
+        sinr_ue_db = 10 * np.log10(all_sinr[:env.scenario.K] + 1e-12)
+        sinr_sue_db = 10 * np.log10(all_sinr[env.scenario.K] + 1e-12)
+
+        results['steps'].append(step)
+        results['P_BS'].append(float(P_BS))
+        results['P_sat'].append(float(P_sat))
+        results['P_total'].append(float(P_total))
+        results['SINR_UE'].append(sinr_ue_db.tolist())
+        results['SINR_SUE'].append(float(sinr_sue_db))
+        results['SINR_min_dB'].append(float(sinr_min_db))
+        results['success'].append(bool(success))
+        results['true_elevation'].append(float(env.true_elevation))
+        results['true_azimuth'].append(float(env.true_azimuth))
+        results['opt_time'].append(float(opt_time))
+
+        success_str = "Y" if success else "N"
+        print(f"{step:>4} | {P_BS:>8.4f} | {P_sat:>8.4f} | {P_total:>8.4f} | {sinr_min_db:>10.2f} | {opt_time:>8.4f} | {success_str:>7}")
+
+        # Step 环境 (用零动作，因为我们已经在 optimizer 里计算了最优解)
+        obs, reward, terminated, truncated, info = env.step(np.zeros(env.scenario.N_ris))
+        done = terminated or truncated
+
+        step += 1
+
+    env.close()
+
+    # 统计信息
+    results['summary'] = {
+        'total_steps': step,
+        'avg_P_BS': float(np.mean(results['P_BS'])),
+        'avg_P_sat': float(np.mean(results['P_sat'])),
+        'avg_P_total': float(np.mean(results['P_total'])),
+        'avg_SINR_min_dB': float(np.mean(results['SINR_min_dB'])),
+        'success_rate': float(np.mean(results['success'])),
+        'total_opt_time': float(total_opt_time),
+        'avg_opt_time': float(total_opt_time / max(step, 1)),
+    }
+
+    print(f"{'-'*75}")
+    print(f"Baseline Optimizer Summary:")
+    print(f"  Total steps: {step}")
+    print(f"  Avg P_BS: {results['summary']['avg_P_BS']:.4f} W")
+    print(f"  Avg P_sat: {results['summary']['avg_P_sat']:.4f} W")
+    print(f"  Avg P_total: {results['summary']['avg_P_total']:.4f} W")
+    print(f"  Avg SINR_min: {results['summary']['avg_SINR_min_dB']:.2f} dB")
+    print(f"  Success rate: {results['summary']['success_rate']*100:.1f}%")
+    print(f"  Avg optimization time: {results['summary']['avg_opt_time']:.4f} s")
+    print(f"{'='*70}\n")
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(save_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"Baseline Optimizer results saved to {save_path}")
 
     return results
 
@@ -678,6 +930,12 @@ def main():
     parser.add_argument('--checkpoint-freq', type=int, default=50000,
                        help='Checkpoint frequency')
 
+    # Baseline evaluation
+    parser.add_argument('--run-baseline-optimizer', action='store_true',
+                       help='Run baseline optimizer evaluation (ZF+SDR) before and after training')
+    parser.add_argument('--skip-zero-baseline', action='store_true',
+                       help='Skip zero-action baseline evaluation')
+
     args = parser.parse_args()
 
     # Check AE checkpoint if using AE
@@ -714,6 +972,8 @@ def main():
         device=args.device,
         log_dir=args.log_dir,
         checkpoint_freq=args.checkpoint_freq,
+        run_baseline_optimizer=args.run_baseline_optimizer,
+        skip_zero_baseline=args.skip_zero_baseline,
         **env_kwargs
     )
 

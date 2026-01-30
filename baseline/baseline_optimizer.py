@@ -159,16 +159,17 @@ class BaselineZFSDROptimizer:
             self._update_satellite_power(H_eff_j, H_sat_eff_j, gamma_j_iter)
 
             # Step 9: Compute total power
-            P_bs = self.P_b * np.linalg.norm(self.w, 'fro') ** 2
-            P_sat = self.P_s * self.N_s
-            P_sum = P_bs + P_sat
-            self.power_history.append(P_sum)
-
+            self.P_bs = self.P_b * np.linalg.norm(self.w, 'fro') ** 2
+            self.P_sat = self.P_s * np.linalg.norm(self.W_sat, 'fro') ** 2
+            self.P_sum = self.P_bs + self.P_sat
+            self.power_history.append(self.P_sum)
+            
+            self.all_sinr = self._print_sinr(H_eff_k, H_eff_j, H_sat_eff_k, H_sat_eff_j, self.w)
             if self.verbose:
                 print(f"\nPower Summary:")
-                print(f"  P_BS:  {P_bs:.4f} W")
-                print(f"  P_SAT: {P_sat:.4f} W")
-                print(f"  P_SUM: {P_sum:.4f} W")
+                print(f"  P_BS:  {self.P_bs:.4f} W")
+                print(f"  P_SAT: {self.P_sat:.4f} W")
+                print(f"  P_SUM: {self.P_sum:.4f} W")
 
             # Step 10: Check convergence
             if abs(self.power_history[-1] - self.power_history[-2]) < self.convergence_tol:
@@ -181,13 +182,15 @@ class BaselineZFSDROptimizer:
             'sum_rate_history': self.sum_rate_history,
             'power_history': self.power_history[1:],  # Exclude initial 0
             'iterations': len(self.sum_rate_history),
-            'final_P_bs': P_bs,
-            'final_P_sat': P_sat,
-            'final_P_sum': P_sum
+            'final_P_bs': self.P_bs,
+            'final_P_sat': self.P_sat,
+            'final_P_sum': self.P_sum,
+            'all_sinr': self.all_sinr
         }
 
         return self.w, self.Phi, info
 
+        
     def evaluate_performance(
         self,
         w: np.ndarray,  # Fixed BS beamforming (N_t, K)
@@ -1054,6 +1057,7 @@ class BaselineZFSDROptimizer:
     def _print_sinr(self, H_eff_k, H_eff_j, H_sat_eff_k, H_sat_eff_j, w):
         """Print SINR for debugging."""
         # BS users
+        all_sinr = []
         for k in range(self.K):
             interference = self.sigma2
             for m in range(self.K):
@@ -1064,6 +1068,7 @@ class BaselineZFSDROptimizer:
 
             signal = self.P_b * np.abs(H_eff_k[k].conj() @ w[:, k]) ** 2
             SINR_dB = 10 * np.log10(signal / interference + self.sigma2)
+            all_sinr.append(signal / interference + self.sigma2)
             print(f"  BS UE({k+1}) SINR: {SINR_dB:.2f} dB")
 
         # Satellite users
@@ -1074,7 +1079,9 @@ class BaselineZFSDROptimizer:
 
             signal = self.P_s * np.abs(H_sat_eff_j[j].conj() @ self.W_sat[:, j]) ** 2
             SINR_dB = 10 * np.log10(signal / interference + self.sigma2)
+            all_sinr.append(signal / interference + self.sigma2)
             print(f"  SAT UE({j+1}) SINR: {SINR_dB:.2f} dB")
+        return all_sinr
 
     def _print_detailed_sinr(self, H_eff_k, H_eff_j, H_sat_eff_k, H_sat_eff_j, p, gamma_k_iter, gamma_j_iter):
         """Print detailed SINR after power allocation."""
