@@ -127,7 +127,7 @@ class ITSNEnv(gym.Env):
         #    - For each of K UE + 1 SUE: (SINR / threshold) - 1
         # Total: 6 + 3 + 3*(K+1) + (K+1) = 9 + 4*(K+1)
         # For K=4: state_dim = 9 + 4*5 = 29
-        state_dim = 171
+        state_dim = 172
 
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -142,7 +142,7 @@ class ITSNEnv(gym.Env):
         self.lambda_min = 0.0
         self.lambda_max = 200.0             # 防止过大导致训练崩
         self.lambda_sinr = float(self.sinr_penalty_weight)  # 初值沿用原本的 sinr_penalty_weight
-        self.delta_phase_max = 0.1*np.pi  # 每步最大相移变化 (0.1π rad)
+        self.delta_phase_max = 0.3*np.pi  # 每步最大相移变化 (0.1π rad)
 
     def reset(self, seed=None, options=None):
         """
@@ -256,8 +256,9 @@ class ITSNEnv(gym.Env):
         self._initialize_with_P_sat()
         
         # Get initial state (with ephemeris noise)
+        self.SINR_diff = np.zeros(self.scenario.SK+self.scenario.K,)
         state = self._get_state()
-
+        self.prev_Phi = self.initial_ris_phase
         return state, {}
 
     def step(self, action):
@@ -294,6 +295,9 @@ class ITSNEnv(gym.Env):
                 Phi, self.current_channels,self.inferred_G_SAT
             )
             P_sat_fixed = self.P_sat_init
+
+            self.SINR_diff = 10*np.log10(self.calculate_all_sinrs(Phi, self.prev_W_bs, self.prev_P_sat, self.current_channels))-\
+                10*np.log10(self.calculate_all_sinrs(self.prev_Phi, self.prev_W_bs, self.prev_P_sat, self.current_channels))
             for _ in range(4):
                 W_fixed, P_BS_norm, decision_success, _ = compute_zf_waterfilling_baseline(
                     H_eff_k, H_eff_j, H_sat_eff_k, self.current_channels['W_sat'],
@@ -357,10 +361,10 @@ class ITSNEnv(gym.Env):
         # 使用加权和速率作为奖励
         reward = self._calculate_reward(P_BS_fixed, P_sat_fixed*np.linalg.norm(self.current_channels['W_sat'],'fro'), avg_sinr_values, avg_success)
 
-        # --- 3.5 更新NLOS缓存 (高斯-马尔可夫模型，为下一step准备) ---
-        self.scenario.update_nlos_cache(self.nlos_alpha)
+        # # --- 3.5 更新NLOS缓存 (高斯-马尔可夫模型，为下一step准备) ---
+        # self.scenario.update_nlos_cache(self.nlos_alpha)
         # 重新生成channels以应用新的NLOS
-        self.current_channels = self.scenario.generate_channels()
+        # self.current_channels = self.scenario.generate_channels()
         
         # --- 6. 更新快照 ---
         self.prev_Phi = Phi
@@ -415,6 +419,8 @@ class ITSNEnv(gym.Env):
         total_p = max(total_p, 1e-12)
         reward_energy = -10.0 * np.log10(total_p)
 
+        
+
         # 2) SINR constraint penalty (linear gap, normalized)
         soft_threshold = 10 ** ((self.sinr_threshold_db - 0.5) / 10.0)  # same spirit as your original
         sinr_gaps = np.maximum(0.0, soft_threshold - all_sinr_values)
@@ -428,7 +434,11 @@ class ITSNEnv(gym.Env):
         # 给一个温和的 bonus，避免盖过主目标
         bonus_success = 5.0 if success else 0.0
 
-        return reward_energy + penalty_sinr + bonus_success
+        # 5) SINR_diff
+        diff = np.sum(self.SINR_diff)
+
+        # return reward_energy + penalty_sinr + bonus_success + diff
+        return diff + penalty_sinr
 
 
     def _calculate_reward_weighted_rate(self, P_BS, P_sat, all_sinr_values, success):
@@ -858,7 +868,7 @@ class ITSNEnv(gym.Env):
         ])
         # 信道特征
         features = self._get_phase_aware_features(self.prev_Phi, self.current_channels)
-        ris = np.angle(np.diag(self.prev_Phi))
+        ris = np.angle(np.diag(self.prev_Phi))/np.pi
         
 
         # ========== 4. Feedback (K+1 dims): SINR Margin ==========
@@ -870,9 +880,10 @@ class ITSNEnv(gym.Env):
             sinr_margin = self.prev_sinr_values
 
         sinr_feedback = sinr_margin  # (K+1,)
-
+        t = np.atleast_1d(self.current_step / self.max_steps)
         # ========== Concatenate All Features ==========
         state = np.concatenate([
+            t,              
             sat_geo,           # (6,)
             features,            # (3,)
             ris,          # (3 * (K+1),)

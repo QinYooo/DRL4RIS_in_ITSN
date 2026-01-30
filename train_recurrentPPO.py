@@ -77,8 +77,8 @@ def train_rl_agent(
     gamma=0.99,
     gae_lambda=0.95,
     clip_range=0.1,
-    ent_coef=0.0,
-    vf_coef=0.5,
+    ent_coef=0.001,
+    vf_coef=0.2,
     max_grad_norm=1.0,
     seed=42,
     device='cuda',
@@ -162,7 +162,7 @@ def train_rl_agent(
     # Create RecurrentPPO agent with LSTM
     policy_kwargs = dict(
         net_arch=dict(pi=[256, 256], vf=[256, 256]),  # Feature extractor before LSTM
-        lstm_hidden_size=256,
+        lstm_hidden_size=128,
         enable_critic_lstm=True,
         n_lstm_layers=1
     )
@@ -178,13 +178,13 @@ def train_rl_agent(
         gae_lambda=gae_lambda,
         clip_range=clip_range,
         ent_coef=ent_coef,
-        vf_coef=0.5,  # Increased from 0.5 to improve value function learning
+        vf_coef=0.2,  # Increased from 0.5 to improve value function learning
         max_grad_norm=max_grad_norm,
         verbose=1,
         tensorboard_log=str(log_path / 'tensorboard'),
         device=device,
         seed=seed,
-        target_kl=0.002,  # KL divergence target for policy updates
+        target_kl=0.01,  # KL divergence target for policy updates
         policy_kwargs=policy_kwargs
     )
 
@@ -379,14 +379,12 @@ def evaluate_on_trajectory(
             ae_checkpoint_path=ae_checkpoint_path,
             rng_seed=seed,
             device=device,
-            enable_ephemeris_noise=False,
             ephemeris_noise_std=0.0,
             **env_kwargs
         )
     else:
         raw_env = ITSNEnv(
             rng_seed=seed,
-            enable_ephemeris_noise=False,
             ephemeris_noise_std=0.0,
             **env_kwargs
         )
@@ -436,7 +434,7 @@ def evaluate_on_trajectory(
             episode_start=episode_starts,
             deterministic=True
         )
-
+        action = action.squeeze()
         episode_starts = np.zeros((1,), dtype=bool)
 
         # 执行动作
@@ -536,15 +534,12 @@ def evaluate_baseline(
         env = ITSNEnvAE(
             ae_checkpoint_path=ae_checkpoint_path,
             rng_seed=seed,
-            device=device,
-            enable_ephemeris_noise=False,
-            ephemeris_noise_std=0.0,
+            device=device
             **env_kwargs
         )
     else:
         env = ITSNEnv(
             rng_seed=seed,
-            enable_ephemeris_noise=False,
             ephemeris_noise_std=0.0,
             **env_kwargs
         )
@@ -676,8 +671,7 @@ def evaluate_baseline_optimizer(
     """
     # 创建评估环境 (禁用 ephemeris noise 以便与 baseline 公平比较)
     env = ITSNEnv(
-        rng_seed=seed,
-        enable_ephemeris_noise=False,  # 禁用噪声，使用真实卫星位置
+        rng_seed=seed, # 禁用噪声，使用真实卫星位置
         ephemeris_noise_std=0.0,
         **env_kwargs
     )
